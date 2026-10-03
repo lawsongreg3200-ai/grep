@@ -1,0 +1,114 @@
+@import "tailwindcss";
+
+@layer base {
+  html,
+  body {
+    background-color: #0a0a1f;
+    color: #ffffff;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  ::selection {
+    background: rgba(181, 123, 224, 0.35);
+    color: #ffffff;
+  }
+}
+
+@layer utilities {
+  /* Fine grid background — old-site look, low opacity */
+  .grid-bg {
+    background-image: linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+    background-size: 42px 42px;
+  }
+
+  /* Uppercase micro-label — old-site typography */
+  .micro-label {
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.25em;
+    font-weight: 600;
+  }
+
+  /* Old-site button: bordered, uppercase, wide tracking */
+  .btn-old {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    padding: 0.65rem 1.25rem;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.2em;
+    color: #ffffff;
+    transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease;
+  }
+  .btn-old:hover {
+    border-color: rgba(255, 255, 255, 0.4);
+    background-color: rgba(255, 255, 255, 0.05);
+  }
+
+  /* Old-site panel: white/10 border, subtle wash */
+  .panel {
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    overflow: hidden;
+  }
+
+  /* Purple accent helpers */
+  .accent-purple {
+    color: #b57be0;
+  }
+  .accent-green {
+    color: #00c853;
+  }
+  .text-error {
+    color: #ef4444;
+  }
+  .mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+
+  /* Scanline sweep across the top of a panel while scanning */
+  @keyframes scanline-sweep {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(100%);
+    }
+  }
+  .scanline-track {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    overflow: hidden;
+    pointer-events: none;
+  }
+  .scanline-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    width: 45%;
+    background: linear-gradient(90deg, transparent, #b57be0, transparent);
+    animation: scanline-sweep 1.5s linear infinite;
+  }
+
+  /* Soft fade/slide entrance */
+  @keyframes rise-in {
+    from {
+      opacity: 0;
+      transform: translateY(10px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+  .rise-in {
+    animation: rise-in 0.6s ease both;
+  }
+}
