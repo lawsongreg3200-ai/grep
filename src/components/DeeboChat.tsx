@@ -341,7 +341,7 @@ Classic social-engineering playbook: urgent tone, spoofed sender, credential har
 High
 
 # ASSUMPTIONS
-• This assesses the attack pattern described in chat, not a specific email in my inbox — the deep email watcher is still in training.`;
+• This assesses the attack pattern described in chat, not a specific email in my inbox — for your real mailbox, ask me "what's in my inbox" from the dashboard and I'll answer from the live scan.`;
 
   if (deviceTopic)
     return `# EXECUTIVE SUMMARY
