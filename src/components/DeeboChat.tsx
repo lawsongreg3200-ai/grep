@@ -8,6 +8,7 @@ const CHIPS = [
   "What can you build?",
   "Can you analyze a whole codebase?",
   "What happens when a virus shows up?",
+  "What did you catch lately?",
   "GO ELITE 🔬",
   "ELITE: Analyze a codebase",
   "ELITE: Threat assessment",
@@ -394,6 +395,7 @@ export function DeeboChat({
   onOpenChange,
   inline = false,
   dashboardReply,
+  deeboEvents,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -401,6 +403,8 @@ export function DeeboChat({
   inline?: boolean;
   /** Dashboard-aware reply hook: return a string to answer, null to fall through to Deebo's normal brain. */
   dashboardReply?: (raw: string) => string | null;
+  /** Post-action narrations from the dashboard ("Moved 'X' to spam…") — Deebo tells them as they happen. */
+  deeboEvents?: string[];
 }) {
   const [messages, setMessages] = useState<Msg[]>([
     {
@@ -414,6 +418,7 @@ export function DeeboChat({
   const [typing, setTyping] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const seenEventsRef = useRef(0);
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -424,6 +429,19 @@ export function DeeboChat({
       if (timerRef.current) clearTimeout(timerRef.current);
     };
   }, []);
+
+  // Post-action narrations (moved / dismissed / failed) — Deebo reports them as they land.
+  useEffect(() => {
+    const events = deeboEvents ?? [];
+    if (events.length > seenEventsRef.current) {
+      const fresh = events.slice(seenEventsRef.current);
+      seenEventsRef.current = events.length;
+      setMessages((m) => [
+        ...m,
+        ...fresh.map((text) => ({ role: "deebo" as const, text, time: now(), elite: false })),
+      ]);
+    }
+  }, [deeboEvents]);
 
   const lastDeebo = [...messages].reverse().find((m) => m.role === "deebo");
   const eliteActive = lastDeebo?.elite ?? false;

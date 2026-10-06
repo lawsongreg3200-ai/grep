@@ -8,6 +8,8 @@ import {
   loadConnection,
   triggerSync,
   listScannedEmails,
+  approveAndAct,
+  dismissEmail,
   type SystemStatus,
   type ConnectionLoaded,
 } from "~/lib/server";
@@ -28,7 +30,7 @@ export const Route = createFileRoute("/dashboard")({
       {
         name: "description",
         content:
-          "Robo Deebo's protection-copilot dashboard. Invite-gated free beta: Deebo watches your real inbox with the phishing engine, flags suspicious mail, and takes zero action without your say-so.",
+          "Robo Deebo's protection-copilot dashboard. Invite-gated free beta: Deebo watches your real inbox with the phishing engine, flags suspicious mail, proposes an action — and acts only on your explicit two-step approval. Every action is audit-logged.",
       },
     ],
   }),
@@ -37,15 +39,15 @@ export const Route = createFileRoute("/dashboard")({
 
 const BETA_KEY = "deebo.beta.v1";
 const SETTINGS_KEY = "deebo.settings.v1";
-const INTENTS_KEY = "deebo.intents.v1";
 const FALLBACK_BETA = "DEEBO-BETA-2026";
 
 type Tab = "inbox" | "chat" | "settings";
-type Intent = "approve" | "dismiss";
 
 /** JSON-safe shape of a scanned real email as returned by listScannedEmails. */
 interface LiveEmail {
   id: number;
+  message_id: string;
+  imap_uid: number | null;
   subject: string;
   sender: string;
   date: string;
@@ -57,6 +59,20 @@ interface LiveEmail {
   explanation: string;
   status: string;
   scanned_at: string;
+  action: ActionRow | null;
+}
+interface ActionRow {
+  id: number;
+  email_id: number;
+  kind: string;
+  status: string;
+  executed_at: string;
+  result: string;
+  error: string;
+  created_at: string;
+}
+interface LatestAction extends ActionRow {
+  subject: string;
 }
 interface SyncMeta {
   last_sync_at: string | null;
@@ -67,6 +83,7 @@ interface SyncMeta {
 interface ScannedInbox {
   emails: LiveEmail[];
   sync: SyncMeta | null;
+  latestActions: LatestAction[];
 }
 
 interface SavedConn {
@@ -102,6 +119,10 @@ function fmtWhen(iso: string | null | undefined): string {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function kindLabel(kind: string): string {
+  return kind === "move-to-spam" ? "MOVE TO SPAM" : kind === "dismiss" ? "DISMISS" : kind.toUpperCase();
 }
 
 function Dashboard() {
@@ -203,18 +224,6 @@ function Dashboard() {
     }
   };
 
-  /* ---------------- inbox intent tracking ---------------- */
-  const [intents, setIntents] = useState<Record<string, Intent>>({});
-  useEffect(() => {
-    const saved = readLS<Record<string, Intent>>(INTENTS_KEY);
-    if (saved) setIntents(saved);
-  }, []);
-  const markIntent = (id: string, v: Intent) => {
-    const next = { ...intents, [id]: v };
-    setIntents(next);
-    writeLS(INTENTS_KEY, next);
-  };
-
   /* ---------------- live email watch state ---------------- */
   const [inbox, setInbox] = useState<ScannedInbox | null>(null);
   const [syncing, setSyncing] = useState(false);
@@ -256,6 +265,7 @@ function Dashboard() {
   }, [syncing, refreshInbox]);
 
   const liveEmails = inbox?.emails ?? [];
+  const latestActions = inbox?.latestActions ?? [];
   const syncMeta = inbox?.sync ?? null;
   const watchFailed = syncMeta && syncMeta.last_sync_ok === 0 && !!syncMeta.last_error;
 
@@ -278,6 +288,17 @@ function Dashboard() {
     return top;
   }, [liveEmails]);
 
+  const actionCounts = useMemo(() => {
+    const c = { acted: 0, dismissed: 0, failed: 0, pending: 0 };
+    for (const e of liveEmails) {
+      if (e.status === "acted") c.acted++;
+      else if (e.status === "dismissed") c.dismissed++;
+      else if (e.status === "failed") c.failed++;
+      else c.pending++;
+    }
+    return c;
+  }, [liveEmails]);
+
   /* ---------------- scored samples (deterministic, client-side) ---------------- */
   const scores = useMemo(
     () =>
@@ -287,6 +308,10 @@ function Dashboard() {
     []
   );
 
+  /* ---------------- Deebo narration feed (post-action stories) ---------------- */
+  const [tales, setTales] = useState<string[]>([]);
+  const tellDeebo = useCallback((n: string) => setTales((t) => [...t, n]), []);
+
   /* ---------------- dashboard-aware chat hook ---------------- */
   const dashboardReply = useCallback(
     (raw: string): string | null => {
@@ -294,12 +319,49 @@ function Dashboard() {
       const aboutMail =
         ["inbox", "email", "mail", "message", "phish"].some((k) => t.includes(k)) &&
         ["what", "how", "any", "risk", "watch", "status", "scan", "count", "score", "patrol"].some((k) => t.includes(k));
+      const asksActions =
+        ["moved", "move", "action", "acted", "log", "caught", "catch", "happen", "last moves", "history", "record", "tale", "what did you", "what did deebo"].some(
+          (k) => t.includes(k)
+        );
+
+      if (asksActions) {
+        const stopWords = new Set([
+          "what", "happened", "did", "deebo", "happen", "last", "moves", "move", "moved", "action",
+          "actions", "act", "acted", "log", "the", "with", "about", "email", "message", "inbox",
+          "catch", "caught", "you", "your", "that", "this", "tell", "me", "any", "know", "moves",
+        ]);
+        const words = t.split(/\W+/).filter((w) => w.length >= 4 && !stopWords.has(w));
+        const matched = liveEmails.find(
+          (e) => words.some((w) => e.subject.toLowerCase().includes(w)) || words.some((w) => e.sender.toLowerCase().includes(w))
+        );
+        if (matched) {
+          const statusLine =
+            matched.status === "acted"
+              ? `MOVED TO SPAM${matched.action ? ` — ${matched.action.result}` : ""}.`
+              : matched.status === "dismissed"
+                ? "DISMISSED — you said it was fine, I left it alone."
+                : matched.status === "failed"
+                  ? `FAILED — ${matched.action?.error ?? "see the action log"}. Left in place, your call next.`
+                  : `still PENDING — flagged ${matched.band}. Approve & act or dismiss it on Inbox Patrol.`;
+          return `"${matched.subject.slice(0, 80)}" from ${matched.sender.slice(0, 40)}: ${statusLine}`;
+        }
+        if (latestActions.length === 0) {
+          return `The ledger's empty so far. I flag — you call — I act only on your word. Every move lands in the ACTION LOG. Say the word and I'll start taking names: hit APPROVE & ACT on Inbox Patrol.`;
+        }
+        const head = `Last moves — ${actionCounts.acted} to spam, ${actionCounts.dismissed} dismissed, ${actionCounts.failed} failed, ${actionCounts.pending} still pending.`;
+        const lines = latestActions.slice(0, 3).map(
+          (a) =>
+            `• ${kindLabel(a.kind)} → ${a.status.toUpperCase()} — "${a.subject.slice(0, 56)}" (${fmtWhen(a.executed_at)})${a.error ? ` — ${a.error.slice(0, 80)}` : ""}`
+        );
+        return `${head}\n${lines.join("\n")}\nFull log is on Inbox Patrol. Never acted without your word — that's the whole rule.`;
+      }
+
       if (!aboutMail) return null;
       if (liveEmails.length) {
         const topMsg = topRisk
           ? `${topRisk.score}/100 ${topRisk.band} — "${topRisk.subject.slice(0, 64)}"`
           : "no messages on the bench yet";
-        return `Patrol's LIVE and I'm watching your real inbox. Right now: ${liveEmails.length} scanned · ${liveCounts.phish} phish · ${liveCounts.suspect} suspect · ${liveCounts.safe} safe. Top risk: ${topMsg}. Heuristic scoring only — I flag, you decide; I don't touch anything without your say-so. Last sync: ${fmtWhen(syncMeta?.last_sync_at ?? null)}.`;
+        return `Patrol's LIVE and I'm watching your real inbox. Right now: ${liveEmails.length} scanned · ${liveCounts.phish} phish · ${liveCounts.suspect} suspect · ${liveCounts.safe} safe. Top risk: ${topMsg}. Heuristic scoring plus your call: I flag and propose, you approve — I move to spam only on your two-step word. Every move's logged. Last sync: ${fmtWhen(syncMeta?.last_sync_at ?? null)}.`;
       }
       if (emailConnected && watchFailed)
         return `I'm connected to your email, but the last sync didn't land: ${syncMeta?.last_error ?? "unknown reason"}. Try the SYNC NOW button on Inbox Patrol.`;
@@ -307,7 +369,7 @@ function Dashboard() {
         return "Email's connected and the watcher's armed — but no messages scanned yet. Hit SYNC NOW on Inbox Patrol and I'll start taking names.";
       return "No inbox to watch yet — plug me in and I'll start taking names. The owner's Gmail is already wired server-side; head to Inbox Patrol to sync it.";
     },
-    [liveEmails, liveCounts, topRisk, syncMeta, emailConnected, watchFailed]
+    [liveEmails, liveCounts, topRisk, syncMeta, emailConnected, watchFailed, latestActions, actionCounts]
   );
 
   /* ---------------- render ---------------- */
@@ -452,8 +514,9 @@ function Dashboard() {
             </h2>
             <p className="mt-2 max-w-2xl text-xs leading-relaxed text-dim sm:text-sm">
               Deebo's phishing watcher is live: it reads the last ~50 messages, scores them with
-              the heuristic engine, and reports. Read-only — he never sends, deletes, or moves
-              anything until you approve an action (approvals ship next).
+              the heuristic engine, and proposes an action on flagged mail. Read-only until you
+              give the word — APPROVE & ACT moves one flagged message to Gmail's Spam, and every
+              move (or failure) lands in Deebo's action log.
             </p>
 
             {!emailConnected ? (
@@ -505,7 +568,7 @@ function Dashboard() {
                 </div>
                 <p className="mt-2 text-xs leading-relaxed text-dim sm:text-sm">
                   {liveEmails.length
-                    ? `Last sync ${fmtWhen(syncMeta?.last_sync_at)} — ${liveCounts.total} messages on the bench: ${liveCounts.phish} phish, ${liveCounts.suspect} suspect, ${liveCounts.safe} safe.`
+                    ? `Last sync ${fmtWhen(syncMeta?.last_sync_at)} — ${liveCounts.total} messages on the bench: ${liveCounts.phish} phish, ${liveCounts.suspect} suspect, ${liveCounts.safe} safe. Deebo's acted ${actionCounts.acted} time${actionCounts.acted === 1 ? "" : "s"} on your word.`
                     : watchFailed
                       ? `Last sync failed (${fmtWhen(syncMeta?.last_sync_at)}): ${syncMeta?.last_error ?? "unknown reason"}. Fix the connection or hit SYNC NOW to retry — the site never breaks, the error just gets recorded.`
                       : "Connected and ready — hit SYNC NOW to scan the most recent ~50 messages. It takes a few seconds."}
@@ -524,22 +587,17 @@ function Dashboard() {
                 <div className="flex flex-wrap items-center gap-3">
                   <h3 className="font-display text-xl text-ink">YOUR INBOX — LIVE PATROL</h3>
                   <span className="rounded-full bg-lime-400/10 px-3 py-1 text-[10px] font-bold tracking-[0.2em] text-lime-400 ring-1 ring-lime-400/50">
-                    REAL MESSAGES · READ-ONLY
+                    REAL MESSAGES · APPROVAL-GATED
                   </span>
                 </div>
                 <p className="mt-1 text-[11px] text-dim/70">
                   The most recent {liveEmails.length} messages from the mailbox, scored by the same
-                  engine as the demo. Nothing has been sent, deleted, or moved — that's the
-                  approval loop, coming next.
+                  engine as the demo. Deebo proposes a move to spam for High/Medium flags — he
+                  never acts without your two-step approval, and every action shows in the log.
                 </p>
                 <div className="mt-5 space-y-4">
                   {liveEmails.map((e) => (
-                    <LiveEmailCard
-                      key={e.id}
-                      email={e}
-                      intent={intents[`real-${e.id}`]}
-                      onIntent={(v) => markIntent(`real-${e.id}`, v)}
-                    />
+                    <LiveEmailCard key={e.id} email={e} onChange={refreshInbox} onNarration={tellDeebo} />
                   ))}
                 </div>
               </div>
@@ -554,21 +612,58 @@ function Dashboard() {
                 </div>
                 <p className="mt-1 text-[11px] text-dim/70">
                   Demo messages scored by the real phishing engine — used only until the live scan
-                  fills the bench. Nothing here is real mail.
+                  fills the bench. Nothing here is real mail, so there's nothing to act on: demo
+                  stays demo.
                 </p>
                 <div className="mt-5 space-y-4">
                   {scores.map(({ email, result }) => (
-                                  <EmailCard
-                                    key={email.id}
-                                    email={email}
-                                    result={result}
-                                    intent={intents[email.id]}
-                                    onIntent={(v) => markIntent(email.id, v)}
-                                  />
-                                ))}
+                    <EmailCard key={email.id} email={email} result={result} />
+                  ))}
                 </div>
               </div>
             )}
+
+            {/* ACTION LOG — what Deebo actually did */}
+            <div className="mt-10 rounded-3xl border-2 border-edge bg-panel p-6">
+              <h3 className="font-display text-xl text-ink">
+                DEEBO'S <span className="text-signal">ACTION LOG</span>
+              </h3>
+              <p className="mt-1 text-[11px] text-dim/70">
+                Every move Deebo made (or tried) on your word — newest first. Nothing happens off
+                this log; nothing happens without your approval.
+              </p>
+              {latestActions.length === 0 ? (
+                <p className="mt-4 rounded-xl border border-dashed border-edge bg-night/50 px-4 py-3 text-xs text-dim">
+                  No actions yet. Approve a flagged message and Deebo's first move lands here.
+                </p>
+              ) : (
+                <ul className="mt-4 space-y-2">
+                  {latestActions.map((a) => (
+                    <li
+                      key={a.id}
+                      className="flex flex-wrap items-center gap-x-3 gap-y-1 rounded-xl border border-edge bg-night/60 px-4 py-2.5 text-xs"
+                    >
+                      <span
+                        className={`rounded-full px-2 py-0.5 text-[9px] font-bold tracking-widest ${
+                          a.status === "executed"
+                            ? "bg-lime-400/10 text-lime-400 ring-1 ring-lime-400/50"
+                            : "bg-blaze/10 text-blaze ring-1 ring-blaze/50"
+                        }`}
+                      >
+                        {kindLabel(a.kind)} · {a.status.toUpperCase()}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate font-semibold text-ink" title={a.subject}>
+                        {a.subject}
+                      </span>
+                      <span className="text-[10px] text-dim">{fmtWhen(a.executed_at)}</span>
+                      <span className={`w-full text-[11px] sm:w-auto ${a.status === "executed" ? "text-dim" : "text-blaze"}`}>
+                        {a.status === "executed" ? a.result || "done" : a.error || "failed"}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
           </section>
         )}
 
@@ -580,11 +675,11 @@ function Dashboard() {
               DEEBO'S <span className="text-signal">DESK</span>
             </h2>
             <p className="mt-2 max-w-2xl text-xs leading-relaxed text-dim sm:text-sm">
-              Same Deebo, new office. Ask him "what's in my inbox" and he'll answer from the live
-              scan — honestly, always.
+              Same Deebo, new office. Ask him "what's in my inbox" or "what did you catch lately"
+              and he'll answer from the live scan and the action log — honestly, always.
             </p>
             <div className="mt-6 h-[560px]">
-              <DeeboChat open inline onOpenChange={() => {}} dashboardReply={dashboardReply} />
+              <DeeboChat open inline onOpenChange={() => {}} dashboardReply={dashboardReply} deeboEvents={tales} />
             </div>
           </section>
         )}
@@ -607,7 +702,7 @@ function Dashboard() {
                 note={
                   status?.dbConfigured
                     ? "A real Postgres is wired — settings can persist there."
-                    : "No usable Postgres yet (the beta decision is local storage). Mail scans persist to sqlite on this machine."
+                    : "No usable Postgres yet (the beta decision is local storage). Mail scans and the action log persist to sqlite on this machine."
                 }
               />
               <StatusTile
@@ -642,11 +737,11 @@ function Dashboard() {
             <div className="mt-6 rounded-3xl border-2 border-edge bg-panel p-6 sm:p-8">
               <h3 className="font-display text-xl text-ink">CONNECT YOUR EMAIL</h3>
               <p className="mt-1 text-xs leading-relaxed text-dim">
-                Deebo watches a mailbox by reading it only — no sends, no deletes, no moves until
-                you approve an action (the approval loop is the next build). The watch already
+                Deebo watches a mailbox read-only and only ever acts on flagged mail with your
+                explicit approval (move-to-spam — never sends, never deletes). The watch already
                 runs with the owner's Gmail account server-side; this form is for keeping your own
                 connection info for when multi-account arrives. Gmail with an app password is the
-                default path; IMAP hosts are read-only on purpose.
+                default path.
               </p>
               <form onSubmit={submitSettings} className="mt-6 grid gap-4 sm:grid-cols-2">
                 <label className="block">
@@ -719,9 +814,9 @@ function Dashboard() {
             <div className="mt-6 rounded-3xl border border-edge bg-night/40 p-6">
               <h3 className="font-display text-base text-ink">ABOUT THIS BETA</h3>
               <ul className="mt-3 space-y-1.5 text-xs leading-relaxed text-dim sm:text-sm">
-                <li>• <span className="font-bold text-ink">Live now:</span> the real inbox watch (last ~50 messages, read-only IMAP scan), the scoring engine, and Deebo's attitude. Scans persist to local sqlite on this machine — no cloud DB in the beta.</li>
-                <li>• <span className="font-bold text-ink">Pending:</span> the approval loop that acts on flagged mail (with your OK per message), real accounts to replace the invite gate, and multi-mailbox support.</li>
-                <li>• <span className="font-bold text-blaze">Straight up:</span> this watch flags and reports — it blocks nothing and takes no action yet. The phishing engine is heuristic decision-support; it flags likely phishing, never claims certainty.</li>
+                <li>• <span className="font-bold text-ink">Live now:</span> the real inbox watch (last ~50 messages, read-only IMAP scan), the scoring engine, and the approval loop — Deebo moves flagged mail to spam only on your two-step approval, and every action is audit-logged. Data persists to local sqlite (one file, dev and prod) — no cloud DB in the beta.</li>
+                <li>• <span className="font-bold text-ink">Pending:</span> real accounts to replace the invite gate, multi-mailbox support, and the on-device protection engine (a later phase).</li>
+                <li>• <span className="font-bold text-blaze">Straight up:</span> Deebo flags and proposes — he never acts without your word, and he never sends or deletes anything. The phishing engine is heuristic decision-support; it flags likely phishing, never claims certainty.</li>
               </ul>
             </div>
           </section>
@@ -729,8 +824,8 @@ function Dashboard() {
       </main>
 
       <footer className="border-t-2 border-edge bg-night px-4 py-8 text-center text-[11px] text-dim/60">
-        Robo Deebo Copilot · invite-gated free beta · the watch is real but read-only — it scans,
-        flags, and reports, and it won't act on anything without your approval. That loop ships next.
+        Robo Deebo Copilot · invite-gated free beta · the watch is real, and so is the rule: Deebo
+        scans, flags, proposes, and acts only on your explicit approval — with every move logged.
       </footer>
     </div>
   );
@@ -750,20 +845,9 @@ function StatusTile({ label, ok, okText, waitText, note }: { label: string; ok: 
   );
 }
 
-/** Demo sample card — scored client-side by the real engine. */
-function EmailCard({
-  email,
-  result,
-  demo,
-  intent,
-  onIntent,
-}: {
-  email: ParsedEmail;
-  result: ScoreResult;
-  demo?: boolean;
-  intent?: Intent;
-  onIntent: (v: Intent) => void;
-}) {
+/** Demo sample card — scored client-side by the real engine. Demo stays demo:
+ *  no action buttons, because there's nothing real to move. */
+function EmailCard({ email, result }: { email: ParsedEmail; result: ScoreResult }) {
   const [showElite, setShowElite] = useState(false);
   return (
     <article className="overflow-hidden rounded-2xl border-2 border-edge bg-panel">
@@ -790,28 +874,9 @@ function EmailCard({
           <p className="mt-1.5 text-xs leading-relaxed text-dim">{result.explanation}</p>
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <button
-            onClick={() => onIntent("approve")}
-            disabled={!!intent}
-            className={`rounded-xl border-2 px-3.5 py-2 font-display text-[10px] tracking-wide transition-colors ${
-              intent === "approve"
-                ? "border-lime-400 bg-lime-400/15 text-lime-400"
-                : "border-signal text-signal hover:bg-signal hover:text-night disabled:opacity-40"
-            }`}
-          >
-            {intent === "approve" ? "✓ APPROVED" : "APPROVE & ACT"}
-          </button>
-          <button
-            onClick={() => onIntent("dismiss")}
-            disabled={!!intent}
-            className={`rounded-xl border-2 px-3.5 py-2 font-display text-[10px] tracking-wide transition-colors ${
-              intent === "dismiss"
-                ? "border-blaze bg-blaze/15 text-blaze"
-                : "border-edge text-dim hover:border-blaze hover:text-blaze disabled:opacity-40"
-            }`}
-          >
-            {intent === "dismiss" ? "✕ DISMISSED" : "DISMISS"}
-          </button>
+          <span className="rounded-xl border border-edge px-3.5 py-2 font-display text-[10px] tracking-wide text-dim/70">
+            DEMO — NO ACTION
+          </span>
           <button
             onClick={() => setShowElite((s) => !s)}
             className="rounded-xl border border-edge px-3.5 py-2 font-display text-[10px] tracking-wide text-dim transition-colors hover:border-signal hover:text-signal"
@@ -820,12 +885,6 @@ function EmailCard({
           </button>
         </div>
       </div>
-      {intent && (
-        <p className="border-t border-edge bg-night/60 px-4 py-2 text-[11px] text-dim">
-          Intent marked: <span className="font-bold text-ink">{intent.toUpperCase()}</span> — queued for
-          Deebo's review before anything happens. <span className="text-blaze">Nothing sent, nothing deleted — this UI only notes your intent.</span>
-        </p>
-      )}
       {showElite && (
         <pre className="whitespace-pre-line border-t border-edge bg-night/80 px-4 py-3 text-[11px] leading-relaxed text-dim">
           {eliteAssessment(email)}
@@ -835,18 +894,66 @@ function EmailCard({
   );
 }
 
-/** Live scanned email card — uses server-computed score + ELITE assessment. */
+/** Live scanned email card — two-step, explicit, server-executed actions. */
 function LiveEmailCard({
   email,
-  intent,
-  onIntent,
+  onChange,
+  onNarration,
 }: {
   email: LiveEmail;
-  intent?: Intent;
-  onIntent: (v: Intent) => void;
+  onChange: () => void;
+  onNarration: (n: string) => void;
 }) {
   const [showElite, setShowElite] = useState(false);
+  const [armed, setArmed] = useState(false);
+  const [busy, setBusy] = useState<null | "act" | "dismiss">(null);
+  const [cardErr, setCardErr] = useState<string | null>(null);
   const band = email.band as RiskBand;
+  const flaggable = email.status === "pending" && (band === "High" || band === "Medium");
+
+  const act = async () => {
+    if (!flaggable || busy) return;
+    if (!armed) {
+      setArmed(true); // first click arms; second click moves
+      return;
+    }
+    setBusy("act");
+    setCardErr(null);
+    setArmed(false);
+    try {
+      const res = await approveAndAct({ data: { emailId: email.id } });
+      onNarration(
+        res.ok
+          ? `Moved "${email.subject.slice(0, 64)}…" to spam — your word, my muscle. Logged.`
+          : `Tried "${email.subject.slice(0, 64)}…" and hit a wall: ${res.error ?? "unknown"}. Message left in place.`
+      );
+      onChange();
+    } catch {
+      setCardErr("Couldn't reach Deebo's server — try again in a moment. Nothing was moved.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const dismiss = async () => {
+    if (!flaggable || busy) return;
+    setBusy("dismiss");
+    setCardErr(null);
+    try {
+      const res = await dismissEmail({ data: { emailId: email.id } });
+      onNarration(
+        res.ok
+          ? `Dismissed "${email.subject.slice(0, 64)}…" — your call, it's none of my business. Logged.`
+          : `Couldn't log a dismissal for "${email.subject.slice(0, 64)}…": ${res.error ?? "unknown"}.`
+      );
+      onChange();
+    } catch {
+      setCardErr("Couldn't reach Deebo's server — try again in a moment.");
+    } finally {
+      setBusy(null);
+    }
+  };
+
   return (
     <article className="overflow-hidden rounded-2xl border-2 border-edge bg-panel">
       <div className="grid gap-3 p-4 sm:grid-cols-[1fr_auto] sm:items-center">
@@ -875,6 +982,19 @@ function LiveEmailCard({
             <span className="rounded-full border border-lime-400/40 bg-lime-400/5 px-2 py-0.5 text-[9px] font-bold tracking-widest text-lime-300">
               REAL
             </span>
+            {email.status !== "pending" && (
+              <span
+                className={`rounded-full px-2 py-0.5 text-[9px] font-bold tracking-widest ${
+                  email.status === "acted"
+                    ? "bg-lime-400/15 text-lime-400 ring-1 ring-lime-400/60"
+                    : email.status === "dismissed"
+                      ? "bg-dim/10 text-dim ring-1 ring-edge"
+                      : "bg-blaze/15 text-blaze ring-1 ring-blaze/60"
+                }`}
+              >
+                {email.status === "acted" ? "✓ MOVED TO SPAM" : email.status === "dismissed" ? "✕ DISMISSED" : "⚠ FAILED"}
+              </span>
+            )}
           </div>
           <p className="mt-2 truncate text-sm font-semibold text-ink" title={email.sender}>
             {email.sender}
@@ -888,30 +1008,69 @@ function LiveEmailCard({
             </p>
           )}
           <p className="mt-1.5 text-xs leading-relaxed text-dim">{email.explanation}</p>
+          {email.status === "pending" && flaggable && (
+            <p className="mt-2 font-marker text-[11px] text-signal">
+              Proposed: move to spam — Deebo acts only on your word.
+            </p>
+          )}
+          {email.status === "pending" && band === "Low" && (
+            <p className="mt-2 text-[11px] text-dim/70">Low risk — no action proposed.</p>
+          )}
+          {email.action && email.status !== "pending" && (
+            <p className="mt-1.5 text-[11px] text-dim/80">
+              Logged: {kindLabel(email.action.kind)} · {email.action.status.toUpperCase()} —{" "}
+              <span className={email.action.status === "executed" ? "text-lime-300" : "text-blaze"}>
+                {email.action.error || email.action.result}
+              </span>{" "}
+              · {fmtWhen(email.action.executed_at)}
+            </p>
+          )}
+          {cardErr && <p className="mt-1.5 text-[11px] font-semibold text-blaze">{cardErr}</p>}
         </div>
         <div className="flex shrink-0 flex-wrap items-center gap-2">
-          <button
-            onClick={() => onIntent("approve")}
-            disabled={!!intent}
-            className={`rounded-xl border-2 px-3.5 py-2 font-display text-[10px] tracking-wide transition-colors ${
-              intent === "approve"
-                ? "border-lime-400 bg-lime-400/15 text-lime-400"
-                : "border-signal text-signal hover:bg-signal hover:text-night disabled:opacity-40"
-            }`}
-          >
-            {intent === "approve" ? "✓ APPROVED" : "APPROVE & ACT"}
-          </button>
-          <button
-            onClick={() => onIntent("dismiss")}
-            disabled={!!intent}
-            className={`rounded-xl border-2 px-3.5 py-2 font-display text-[10px] tracking-wide transition-colors ${
-              intent === "dismiss"
-                ? "border-blaze bg-blaze/15 text-blaze"
-                : "border-edge text-dim hover:border-blaze hover:text-blaze disabled:opacity-40"
-            }`}
-          >
-            {intent === "dismiss" ? "✕ DISMISSED" : "DISMISS"}
-          </button>
+          {flaggable ? (
+            <>
+              {armed ? (
+                <>
+                  <button
+                    onClick={act}
+                    disabled={!!busy}
+                    className="rounded-xl border-2 border-blaze bg-blaze/15 px-3.5 py-2 font-display text-[10px] font-bold tracking-wide text-blaze transition-colors hover:bg-blaze hover:text-night disabled:opacity-50"
+                  >
+                    {busy === "act" ? "MOVING TO SPAM…" : "CONFIRM — MOVE TO SPAM"}
+                  </button>
+                  <button
+                    onClick={() => setArmed(false)}
+                    disabled={!!busy}
+                    className="rounded-xl border border-edge px-3.5 py-2 font-display text-[10px] tracking-wide text-dim transition-colors hover:border-dim hover:text-ink disabled:opacity-50"
+                  >
+                    CANCEL
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    onClick={act}
+                    disabled={!!busy}
+                    className="rounded-xl border-2 border-signal px-3.5 py-2 font-display text-[10px] tracking-wide text-signal transition-colors hover:bg-signal hover:text-night disabled:opacity-50"
+                  >
+                    {busy === "act" ? "MOVING TO SPAM…" : busy === "dismiss" ? "HOLD UP…" : "APPROVE & ACT"}
+                  </button>
+                  <button
+                    onClick={dismiss}
+                    disabled={!!busy}
+                    className="rounded-xl border-2 border-edge px-3.5 py-2 font-display text-[10px] tracking-wide text-dim transition-colors hover:border-blaze hover:text-blaze disabled:opacity-50"
+                  >
+                    {busy === "dismiss" ? "DISMISSING…" : "DISMISS"}
+                  </button>
+                </>
+              )}
+            </>
+          ) : email.status === "failed" ? (
+            <span className="rounded-xl border border-blaze/50 px-3.5 py-2 font-display text-[10px] tracking-wide text-blaze">
+              LEFT IN PLACE — YOUR CALL
+            </span>
+          ) : null}
           <button
             onClick={() => setShowElite((s) => !s)}
             className="rounded-xl border border-edge px-3.5 py-2 font-display text-[10px] tracking-wide text-dim transition-colors hover:border-signal hover:text-signal"
@@ -920,11 +1079,10 @@ function LiveEmailCard({
           </button>
         </div>
       </div>
-      {intent && (
-        <p className="border-t border-edge bg-night/60 px-4 py-2 text-[11px] text-dim">
-          Intent marked: <span className="font-bold text-ink">{intent.toUpperCase()}</span> — queued for
-          Deebo's review. The approval loop that actually acts on your mailbox is the next build.{" "}
-          <span className="text-blaze">Nothing sent, nothing deleted — this UI only notes your intent.</span>
+      {armed && (
+        <p className="border-t border-blaze/40 bg-blaze/5 px-4 py-2 text-[11px] text-blaze">
+          ⚠ This moves the real message in your Gmail. Only Deebo's flagged mail. Your call —
+          confirm and it's done, logged, and out of your inbox.
         </p>
       )}
       {showElite && (

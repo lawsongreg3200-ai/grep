@@ -20,6 +20,15 @@ import { ImapFlow } from "imapflow";
 import { scoreEmail, eliteAssessment, type ParsedEmail } from "./phishing";
 import { upsertEmail, setSyncOk, setSyncError } from "./sqlite";
 
+/** Outcome of an owner-approved move-to-spam. */
+export interface MoveResult {
+  ok: boolean;
+  outcome: "moved" | "already-gone";
+  detail?: string;
+  error?: string;
+  durationMs: number;
+}
+
 export interface SyncResult {
   ok: boolean;
   attempted: number; // messages fetched from the mailbox
@@ -116,6 +125,7 @@ async function doSync(): Promise<SyncResult> {
             scored.band === "Low" ? "safe" : scored.band === "Medium" ? "suspect" : "phish";
           upsertEmail({
             message_id: parsed.id,
+            imap_uid: msg.uid ?? null,
             subject: parsed.subject || "(no subject)",
             sender: parsed.from || "(unknown sender)",
             date: parsed.date || "",
@@ -151,6 +161,126 @@ async function doSync(): Promise<SyncResult> {
         stored: 0,
         error,
         errorKind: isAuth ? "auth" : "network",
+        durationMs: Date.now() - started,
+      };
+    } finally {
+      if (connected) {
+        try {
+          await client.logout();
+        } catch {
+          /* already gone — fine */
+        }
+      }
+    }
+  })();
+
+  return Promise.race([timeout, work]);
+}
+
+/* ------------------------------------------------------------------ */
+/* Owner-approved action: move one flagged message to Gmail's Spam      */
+/* ------------------------------------------------------------------ */
+
+const ACT_BUDGET_MS = 20_000;
+
+/**
+ * Move message `uid` out of INBOX into the Gmail spam folder. ONLY ever called
+ * from approveAndAct after the owner's explicit two-step confirmation — this
+ * function never runs on its own. Never EXPUNGEs, never permanently deletes:
+ * Gmail's Spam folder holds the message (auto-purge is Gmail's own 30-day
+ * rule). If the message is already gone from INBOX, reports 'already-gone'
+ * (the act is a no-op). Errors are returned, never thrown; the app password
+ * is redacted from any message before it leaves this module.
+ */
+export function moveMessageToSpam(uid: number): Promise<MoveResult> {
+  const started = Date.now();
+  const { user, pass } = emailCredentials();
+  if (!user || !pass) {
+    return Promise.resolve({
+      ok: false,
+      outcome: "already-gone" as const,
+      error: "No email credentials configured.",
+      durationMs: Date.now() - started,
+    });
+  }
+  if (!Number.isInteger(uid) || uid <= 0) {
+    return Promise.resolve({
+      ok: false,
+      outcome: "already-gone" as const,
+      error: "No IMAP UID recorded for this message — run SYNC NOW to refresh the bench, then try again.",
+      durationMs: Date.now() - started,
+    });
+  }
+
+  const timeout = new Promise<MoveResult>((resolve) =>
+    setTimeout(
+      () =>
+        resolve({
+          ok: false,
+          outcome: "already-gone" as const,
+          error: `Move timed out after ${ACT_BUDGET_MS / 1000}s.`,
+          durationMs: ACT_BUDGET_MS,
+        }),
+      ACT_BUDGET_MS
+    )
+  );
+
+  const work = (async (): Promise<MoveResult> => {
+    const client = new ImapFlow({
+      host: HOST,
+      port: PORT,
+      secure: true,
+      auth: { user, pass },
+      logger: false,
+      connectionTimeout: 15_000,
+      tls: { rejectUnauthorized: true },
+    });
+    let connected = false;
+    try {
+      await client.connect();
+      connected = true;
+      const lock = await client.getMailboxLock("INBOX");
+      try {
+        await client.mailboxOpen("INBOX");
+        const existing = await client.fetchOne(String(uid), { uid: true }, { uid: true });
+        if (!existing) {
+          return {
+            ok: true,
+            outcome: "already-gone",
+            detail: "Message is no longer in INBOX (already moved/deleted) — marked complete.",
+            durationMs: Date.now() - started,
+          };
+        }
+        const targets = ["[Gmail]/Spam", "Spam"];
+        let lastErr = "";
+        for (const target of targets) {
+          try {
+            await client.messageMove(uid, target, { uid: true });
+            return {
+              ok: true,
+              outcome: "moved",
+              detail: `Moved to ${target}.`,
+              durationMs: Date.now() - started,
+            };
+          } catch (e) {
+            lastErr = String((e as Error)?.message ?? e).replace(pass, "[redacted]");
+          }
+        }
+        return {
+          ok: false,
+          outcome: "already-gone" as const,
+          error: `Move rejected by Gmail on both spam folders: ${lastErr.slice(0, 240)}`,
+          durationMs: Date.now() - started,
+        };
+      } finally {
+        lock.release();
+      }
+    } catch (e) {
+      const raw = String((e as Error)?.message ?? e).replace(pass, "[redacted]");
+      return {
+        ok: false,
+        outcome: "already-gone" as const,
+        error: `IMAP move failed: ${raw.slice(0, 240)}`,
         durationMs: Date.now() - started,
       };
     } finally {

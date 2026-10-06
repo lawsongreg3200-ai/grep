@@ -1,37 +1,48 @@
 /**
  * ROBO DEEBO — local email-watch database (bun:sqlite).
  *
- * Server-only. The free-beta decision is "no external DB": scanned messages and
- * sync health live in a sqlite file under /home/team/shared/site/data/deebo.db
- * (the shared tree survives machine swaps; the file is git-ignored). Every
- * function degrades gracefully and never throws outward — the server fns layer
- * honest "storage broken" states instead of crashing.
+ * Server-only. The free-beta decision is "no external DB": scanned messages,
+ * sync health, and the action audit log live in a sqlite file at an ABSOLUTE
+ * pinned path — /home/team/shared/site/data/deebo.db — so dev and the
+ * production build resolve to the SAME database (the slice-2 bug was
+ * import.meta.dir drifting between src/lib and dist/server, producing two
+ * divergent databases). Every function degrades gracefully and never throws
+ * outward — the server fns layer honest "storage broken" states instead of
+ * crashing.
  *
  * Imported by src/lib/server.ts; used only inside createServerFn handlers and
  * the IMAP sync routine. Never import this from a client component directly.
  */
 import { Database } from "bun:sqlite";
 import { mkdirSync } from "node:fs";
-import { resolve } from "node:path";
+import { dirname } from "node:path";
 
-/** site/data/deebo.db — import.meta.dir is src/lib (dev) or dist/server (prod build). */
+/**
+ * The one database file, dev or prod. Absolute on purpose — do NOT resolve
+ * against import.meta.dir (dev builds and prod builds put that in different
+ * trees). $DEEBO_DB_PATH exists only for tests/sandboxes; the default is the
+ * pinned shared-tree path.
+ */
+const DB_PATH = process.env.DEEBO_DB_PATH || "/home/team/shared/site/data/deebo.db";
+
 export function dbFilePath(): string {
-  return resolve(import.meta.dir, "../../data/deebo.db");
+  return DB_PATH;
 }
 
 let _db: Database | null = null;
 
-/** Lazily open (and initialize) the sqlite database. Throws on real IO failure. */
+/** Lazily open (and initialize/migrate) the sqlite database. Throws on real IO failure. */
 function open(): Database {
   if (_db) return _db;
-  mkdirSync(resolve(import.meta.dir, "../../data"), { recursive: true });
-  const db = new Database(dbFilePath());
+  mkdirSync(dirname(DB_PATH), { recursive: true });
+  const db = new Database(DB_PATH);
   db.exec("PRAGMA journal_mode = WAL;");
   db.exec("PRAGMA busy_timeout = 5000;");
   db.exec(`
     CREATE TABLE IF NOT EXISTS emails (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       message_id TEXT NOT NULL UNIQUE,
+      imap_uid INTEGER,
       subject TEXT NOT NULL DEFAULT '',
       sender TEXT NOT NULL DEFAULT '',
       date TEXT NOT NULL DEFAULT '',
@@ -53,11 +64,27 @@ function open(): Database {
       message_count INTEGER NOT NULL DEFAULT 0
     );
     INSERT OR IGNORE INTO sync_meta (id, last_sync_ok, message_count) VALUES (1, 0, 0);
+    -- Audit log: every acted-upon or attempted action lands here.
+    CREATE TABLE IF NOT EXISTS actions (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email_id INTEGER NOT NULL,
+      kind TEXT NOT NULL,
+      status TEXT NOT NULL,
+      executed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      result TEXT NOT NULL DEFAULT '',
+      error TEXT NOT NULL DEFAULT '',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_actions_email ON actions (email_id, id DESC);
+    CREATE INDEX IF NOT EXISTS idx_actions_recent ON actions (id DESC);
   `);
-  // Safe migration for DBs created before the explanation column existed.
+  // Safe migrations for DBs created before these columns/tables existed.
   const cols = db.query("PRAGMA table_info(emails)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "explanation")) {
     db.exec("ALTER TABLE emails ADD COLUMN explanation TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "imap_uid")) {
+    db.exec("ALTER TABLE emails ADD COLUMN imap_uid INTEGER");
   }
   _db = db;
   return db;
@@ -70,6 +97,7 @@ function open(): Database {
 export interface EmailRow {
   id: number;
   message_id: string;
+  imap_uid: number | null;
   subject: string;
   sender: string;
   date: string;
@@ -80,7 +108,7 @@ export interface EmailRow {
   verdict: string; // safe | suspect | phish
   elite: string;
   explanation: string;
-  status: string; // pending | approved | dismissed
+  status: string; // pending | acted | dismissed | failed (per-message life state)
   scanned_at: string;
 }
 
@@ -91,9 +119,25 @@ export interface SyncMetaRow {
   message_count: number;
 }
 
+export interface ActionRow {
+  id: number;
+  email_id: number;
+  kind: string; // move-to-spam | dismiss
+  status: string; // executed | failed
+  executed_at: string;
+  result: string;
+  error: string;
+  created_at: string;
+}
+
+export interface ActionWithSubject extends ActionRow {
+  subject: string;
+}
+
 /** Inserts or refreshes a scanned email; keeps the patrol status on re-scan. */
 export function upsertEmail(e: {
   message_id: string;
+  imap_uid: number | null;
   subject: string;
   sender: string;
   date: string;
@@ -108,17 +152,18 @@ export function upsertEmail(e: {
   const db = open();
   db.query(
     `INSERT INTO emails
-       (message_id, subject, sender, date, body_snippet, flags, score, band, verdict, elite, explanation)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (message_id, imap_uid, subject, sender, date, body_snippet, flags, score, band, verdict, elite, explanation)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT(message_id) DO UPDATE SET
-       subject=excluded.subject, sender=excluded.sender, date=excluded.date,
-       body_snippet=excluded.body_snippet, flags=excluded.flags, score=excluded.score,
-       band=excluded.band, verdict=excluded.verdict, elite=excluded.elite,
-       explanation=excluded.explanation,
+       imap_uid=excluded.imap_uid, subject=excluded.subject, sender=excluded.sender,
+       date=excluded.date, body_snippet=excluded.body_snippet, flags=excluded.flags,
+       score=excluded.score, band=excluded.band, verdict=excluded.verdict,
+       elite=excluded.elite, explanation=excluded.explanation,
        scanned_at=excluded.scanned_at,
        status=emails.status`
   ).run(
     e.message_id,
+    e.imap_uid,
     e.subject,
     e.sender,
     e.date,
@@ -147,6 +192,17 @@ export function countEmails(): number {
   return r.n;
 }
 
+export function getEmail(id: number): EmailRow | null {
+  const db = open();
+  const r = db.query("SELECT * FROM emails WHERE id = ?").get(id) as unknown as EmailRow | null;
+  return r ?? null;
+}
+
+export function setEmailStatus(id: number, status: string): void {
+  const db = open();
+  db.query("UPDATE emails SET status = ? WHERE id = ?").run(status, id);
+}
+
 export function getSyncMeta(): SyncMetaRow {
   const db = open();
   const r = db.query("SELECT * FROM sync_meta WHERE id = 1").get() as unknown as SyncMetaRow;
@@ -165,6 +221,66 @@ export function setSyncError(at: string, error: string): void {
   db.query(
     "UPDATE sync_meta SET last_sync_at=?, last_sync_ok=0, last_error=? WHERE id=1"
   ).run(at, error);
+}
+
+/* ------------------------------------------------------------------ */
+/* Action audit log                                                    */
+/* ------------------------------------------------------------------ */
+
+/** Append an audit row. executed_at defaults to sqlite now(); pass ISO for consistency. */
+export function addAction(a: {
+  email_id: number;
+  kind: string;
+  status: string;
+  result?: string;
+  error?: string;
+  executed_at?: string;
+}): number {
+  const db = open();
+  const r = db
+    .query(
+      `INSERT INTO actions (email_id, kind, status, executed_at, result, error)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    )
+    .run(a.email_id, a.kind, a.status, a.executed_at ?? new Date().toISOString(), a.result ?? "", a.error ?? "");
+  return Number(r.lastInsertRowid);
+}
+
+/** Latest action row for one email, or null. */
+export function latestActionForEmail(emailId: number): ActionRow | null {
+  const db = open();
+  const r = db
+    .query("SELECT * FROM actions WHERE email_id = ? ORDER BY id DESC LIMIT 1")
+    .get(emailId) as unknown as ActionRow | null;
+  return r ?? null;
+}
+
+/** Latest action per email for a batch of ids (Map keyed by email id). */
+export function latestActionsByEmail(ids: number[]): Map<number, ActionRow> {
+  const map = new Map<number, ActionRow>();
+  if (!ids.length) return map;
+  const db = open();
+  const rows = db
+    .query(`SELECT * FROM actions WHERE email_id IN (${ids.map(() => "?").join(",")}) ORDER BY id DESC`)
+    .all(...ids) as unknown as ActionRow[];
+  for (const r of rows) {
+    if (!map.has(r.email_id)) map.set(r.email_id, r);
+  }
+  return map;
+}
+
+/** Most recent actions overall, joined with the email subject (for the ACTION LOG). */
+export function listActions(limit = 10): ActionWithSubject[] {
+  const db = open();
+  const rows = db
+    .query(
+      `SELECT a.id, a.email_id, a.kind, a.status, a.executed_at, a.result, a.error, a.created_at,
+              COALESCE(e.subject, '(message no longer on bench)') AS subject
+       FROM actions a LEFT JOIN emails e ON e.id = a.email_id
+       ORDER BY a.id DESC LIMIT ?`
+    )
+    .all(limit) as unknown as ActionWithSubject[];
+  return rows;
 }
 
 /** Storage health probe: returns the db path and how many tables exist. */

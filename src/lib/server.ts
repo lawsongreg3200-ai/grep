@@ -7,8 +7,22 @@
  */
 import { createServerFn } from "@tanstack/react-start";
 import { sql } from "~/db";
-import { storageHealth, listEmails, countEmails, getSyncMeta, type EmailRow, type SyncMetaRow } from "./sqlite";
-import { runEmailSync, emailConfigured, type SyncResult } from "./imap";
+import {
+  storageHealth,
+  listEmails,
+  countEmails,
+  getSyncMeta,
+  getEmail,
+  setEmailStatus,
+  addAction,
+  latestActionsByEmail,
+  listActions,
+  type EmailRow,
+  type SyncMetaRow,
+  type ActionRow,
+  type ActionWithSubject,
+} from "./sqlite";
+import { runEmailSync, emailConfigured, moveMessageToSpam, type SyncResult } from "./imap";
 
 export interface SystemStatus {
   dbConfigured: boolean;
@@ -141,8 +155,10 @@ export const triggerSync = createServerFn({ method: "POST" }).handler(
 );
 
 export interface ScannedInbox {
-  emails: EmailRow[];
+  emails: (EmailRow & { action: ActionRow | null })[];
   sync: SyncMetaRow | null;
+  /** Last ~10 audited actions for the ACTION LOG (newest first). */
+  latestActions: ActionWithSubject[];
 }
 
 /** Most recent scanned emails (real messages from the mailbox scan). */
@@ -154,5 +170,176 @@ export const listScannedEmails = createServerFn().handler(async (): Promise<Scan
   } catch {
     sync = null;
   }
-  return { emails, sync };
+  const byId = latestActionsByEmail(emails.map((e) => e.id));
+  const withActions = emails.map((e) => ({ ...e, action: byId.get(e.id) ?? null }));
+  let latestActions: ActionWithSubject[] = [];
+  try {
+    latestActions = listActions(10);
+  } catch {
+    latestActions = [];
+  }
+  return { emails: withActions, sync, latestActions };
 });
+
+/* ------------------------------------------------------------------ */
+/* Slice 3 — the approval loop that ACTS (owner-ratified)              */
+/* ------------------------------------------------------------------ */
+
+export interface ActResult {
+  ok: boolean;
+  emailId: number;
+  subject: string;
+  /** Post-call per-message state: acted | dismissed | failed | (unchanged). */
+  status: string;
+  outcome?: "moved" | "already-gone";
+  result?: string;
+  error?: string;
+  actionId?: number;
+}
+
+/**
+ * Move one flagged message to Gmail's Spam — only ever reached through the
+ * owner's explicit two-step confirmation in the dashboard. Guards: the row
+ * must exist, be band High or Medium, be status 'pending', and carry an
+ * imap_uid (synced rows only). Idempotent: an already-acted row returns its
+ * current state without touching the mailbox. Every attempt is audit-logged;
+ * on failure the message is left safe in place (never expunged, never deleted).
+ */
+export const approveAndAct = createServerFn({ method: "POST" }).handler(
+  async ({ data }): Promise<ActResult> => {
+    const emailId = Number((data as { emailId?: unknown } | null)?.emailId);
+    if (!Number.isInteger(emailId) || emailId <= 0) {
+      return { ok: false, emailId, subject: "", status: "failed", error: "Invalid email id." };
+    }
+    try {
+      const row = getEmail(emailId);
+      if (!row) {
+        return { ok: false, emailId, subject: "", status: "failed", error: "Message not found on the patrol bench." };
+      }
+      if (row.status !== "pending") {
+        return {
+          ok: true,
+          emailId,
+          subject: row.subject,
+          status: row.status,
+          result: `Already ${row.status} — no action taken.`,
+        };
+      }
+      if (row.band !== "High" && row.band !== "Medium") {
+        return {
+          ok: false,
+          emailId,
+          subject: row.subject,
+          status: "failed",
+          error: `Not a flagged message (band ${row.band}) — Deebo only acts on High/Medium flags.`,
+        };
+      }
+      if (!row.imap_uid) {
+        return {
+          ok: false,
+          emailId,
+          subject: row.subject,
+          status: "failed",
+          error: "No IMAP UID recorded for this message yet — run SYNC NOW to refresh the bench, then try again.",
+        };
+      }
+      const mv = await moveMessageToSpam(row.imap_uid);
+      if (mv.ok) {
+        setEmailStatus(emailId, "acted");
+        const actionId = addAction({
+          email_id: emailId,
+          kind: "move-to-spam",
+          status: "executed",
+          result: `moved to spam — ${mv.outcome}`,
+          error: "",
+        });
+        return {
+          ok: true,
+          emailId,
+          subject: row.subject,
+          status: "acted",
+          outcome: mv.outcome,
+          result:
+            mv.outcome === "moved"
+              ? "Moved to spam — message is now in Gmail's Spam folder."
+              : "Message was already out of INBOX — marked complete.",
+          actionId,
+        };
+      }
+      // Failure: keep the message safe in place; record exactly why.
+      setEmailStatus(emailId, "failed");
+      const actionId = addAction({
+        email_id: emailId,
+        kind: "move-to-spam",
+        status: "failed",
+        result: "",
+        error: mv.error || "unknown IMAP error",
+      });
+      return {
+        ok: false,
+        emailId,
+        subject: row.subject,
+        status: "failed",
+        error: mv.error || "The move failed — see the action log. The message was left in place.",
+        actionId,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        emailId,
+        subject: "",
+        status: "failed",
+        error: `Move could not be recorded: ${String((e as Error)?.message ?? e).slice(0, 240)}`,
+      };
+    }
+  }
+);
+
+/** Owner says this one's fine — NO mailbox action, just audit-logged. */
+export const dismissEmail = createServerFn({ method: "POST" }).handler(
+  async ({ data }): Promise<ActResult> => {
+    const emailId = Number((data as { emailId?: unknown } | null)?.emailId);
+    if (!Number.isInteger(emailId) || emailId <= 0) {
+      return { ok: false, emailId, subject: "", status: "failed", error: "Invalid email id." };
+    }
+    try {
+      const row = getEmail(emailId);
+      if (!row) {
+        return { ok: false, emailId, subject: "", status: "failed", error: "Message not found on the patrol bench." };
+      }
+      if (row.status !== "pending") {
+        return {
+          ok: true,
+          emailId,
+          subject: row.subject,
+          status: row.status,
+          result: `Already ${row.status} — no action taken.`,
+        };
+      }
+      setEmailStatus(emailId, "dismissed");
+      const actionId = addAction({
+        email_id: emailId,
+        kind: "dismiss",
+        status: "executed",
+        result: "dismissed by owner — no action",
+        error: "",
+      });
+      return {
+        ok: true,
+        emailId,
+        subject: row.subject,
+        status: "dismissed",
+        result: "Dismissed — Deebo left it alone. Logged.",
+        actionId,
+      };
+    } catch (e) {
+      return {
+        ok: false,
+        emailId,
+        subject: "",
+        status: "failed",
+        error: `Dismiss could not be recorded: ${String((e as Error)?.message ?? e).slice(0, 240)}`,
+      };
+    }
+  }
+);
