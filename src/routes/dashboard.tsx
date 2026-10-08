@@ -1110,7 +1110,7 @@ function LiveEmailCard({
                   })}
                 </ul>
               ) : (
-                <p className="mt-1.5 text-[11px] text-dim/70">No links in this message — clean.</p>
+                <p className="mt-1.5 text-[11px] text-dim/70">No links on file — the last sync found none (re-sync to double-check).</p>
               )}
             </div>
           )}
