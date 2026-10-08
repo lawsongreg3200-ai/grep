@@ -18,7 +18,8 @@
  */
 import { ImapFlow } from "imapflow";
 import { scoreEmail, eliteAssessment, type ParsedEmail } from "./phishing";
-import { upsertEmail, setSyncOk, setSyncError } from "./sqlite";
+import { upsertEmail, setSyncOk, setSyncError, replaceEmailLinks } from "./sqlite";
+import { extractLinks, unwrapShortener, gsbThreatMatches, assessLinks, type LinkAssessment } from "./urlcheck";
 
 /** Outcome of an owner-approved move-to-spam. */
 export interface MoveResult {
@@ -104,6 +105,8 @@ async function doSync(): Promise<SyncResult> {
     });
     let processed = 0;
     let connected = false;
+    /** Slice 5: collected link check work, persisted after the fetch loop. */
+    const pendingLinks = new Map<number, { links: string[]; senderDomain?: string }>();
     try {
       await client.connect();
       connected = true;
@@ -123,7 +126,7 @@ async function doSync(): Promise<SyncResult> {
           const scored = scoreEmail(parsed);
           const verdict =
             scored.band === "Low" ? "safe" : scored.band === "Medium" ? "suspect" : "phish";
-          upsertEmail({
+          const emailId = upsertEmail({
             message_id: parsed.id,
             imap_uid: msg.uid ?? null,
             subject: parsed.subject || "(no subject)",
@@ -137,11 +140,18 @@ async function doSync(): Promise<SyncResult> {
             elite: eliteAssessment(parsed),
             explanation: scored.explanation,
           });
+          if (emailId > 0) {
+            const links = extractLinks(parsed.rawHtml ?? null, parsed.body);
+            if (links.length) pendingLinks.set(emailId, { links, senderDomain: parsed.fromDomain });
+          }
           processed++;
         }
       } finally {
         lock.release();
       }
+      // Slice 5: one batched GSB call + heuristic checks over every link found,
+      // persisted per email. Wrapped so a link-check problem never fails the sync.
+      await finalizeLinkChecks(pendingLinks);
       const result: SyncResult = {
         ok: true,
         attempted: processed,
@@ -151,7 +161,7 @@ async function doSync(): Promise<SyncResult> {
       setSyncOk(new Date().toISOString(), processed);
       return result;
     } catch (e) {
-      const raw = String((e as Error)?.message ?? e).replace(c.pass, "[redacted]");
+      const raw = String((e as Error)?.message ?? e).replace(pass, "[redacted]");
       const isAuth = /auth|login|credentials/i.test(raw);
       const error = isAuth ? "AUTH failed — bad app password" : `IMAP sync failed: ${raw.slice(0, 200)}`;
       setSyncError(new Date().toISOString(), error);
@@ -326,7 +336,7 @@ function parseMessage(msg: RawMessage): ParsedEmail | null {
   const messageIdHeader = (headers.get("message-id") || "").trim();
   const dateHeader = headers.get("date") || "";
 
-  const { text: bodyText, links, attachments } = parseBody(bodyBlock, headers);
+  const { text: bodyText, links, attachments, rawHtml } = parseBody(bodyBlock, headers);
 
   const date =
     safeDateString(msg.envelope?.date) ||
@@ -343,6 +353,7 @@ function parseMessage(msg: RawMessage): ParsedEmail | null {
     subject: subjectHeader,
     body: bodyText.slice(0, 6000),
     links,
+    rawHtml,
     attachments,
     date,
   };
@@ -409,11 +420,59 @@ function snippet(body: string): string {
   return clean.length > 260 ? clean.slice(0, 260) + "…" : clean;
 }
 
+/* ------------------------------------------------------------------ */
+/* Slice 5 — URL reputation finalize                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Assess + persist link reputations for every collected email: unwrap each
+ * unique shortened URL once (tight hop limit), run ONE batched Google Safe
+ * Browsing call over all final URLs, then combine with the always-on
+ * heuristics per link. Best-effort — if it fails or the 22s sync budget cuts
+ * it short, the emails are already stored and the next sync retries.
+ */
+async function finalizeLinkChecks(
+  pending: Map<number, { links: string[]; senderDomain?: string }>
+): Promise<void> {
+  if (!pending.size) return;
+  try {
+    const finalBySource = new Map<string, string>();
+    for (const { links } of pending.values()) {
+      for (const u of links) {
+        if (!finalBySource.has(u)) finalBySource.set(u, (await unwrapShortener(u)).final_url);
+      }
+    }
+    const gsb = await gsbThreatMatches([...finalBySource.values()]);
+    for (const [emailId, { links, senderDomain }] of pending) {
+      const assessments = await assessLinks(links, senderDomain, gsb);
+      replaceEmailLinks(
+        emailId,
+        assessments.map((a) => ({
+          url: a.url,
+          final_url: a.final_url,
+          host: a.host,
+          shortener: a.shortener,
+          shortener_hops: a.shortener_hops,
+          heuristic_verdict: a.heuristic.verdict,
+          heuristic_reason: a.heuristic.reason,
+          gsb_verdict: a.gsb.verdict,
+          gsb_threats: a.gsb.threats,
+          gsb_source: a.gsb.source,
+          combined: a.combined,
+          combined_reason: a.combined_reason,
+        }))
+      );
+    }
+  } catch {
+    /* best-effort: emails are stored; links re-check on the next sync */
+  }
+}
+
 /** Walks the MIME body for the first text alternative, links, and attachments. */
 function parseBody(
   body: string,
   headers: Map<string, string>
-): { text: string; links: string[]; attachments: string[] } {
+): { text: string; links: string[]; attachments: string[]; rawHtml?: string } {
   const links: string[] = [];
   const attachments: string[] = [];
   const ctype = (headers.get("content-type") || "text/plain").toLowerCase();
@@ -421,7 +480,7 @@ function parseBody(
 
   if (!ctype.includes("multipart/")) {
     const decoded = decodeBody(body, cte);
-    return { text: cleanText(decoded, ctype, links), links, attachments };
+    return { text: cleanText(decoded, ctype, links), links, attachments, rawHtml: ctype.includes("html") ? decoded : undefined };
   }
 
   // naive multipart split (good enough for text/plain + text/html + attachments)
@@ -430,6 +489,7 @@ function parseBody(
   const boundary = boundaryMatch[1];
   const parts = body.split(`--${boundary}`);
   let text = "";
+  let rawHtml: string | undefined;
   for (const part of parts) {
     const pidx = part.indexOf("\r\n\r\n");
     const phead = pidx >= 0 ? part.slice(0, pidx) : "";
@@ -444,11 +504,12 @@ function parseBody(
     }
     if (pct.includes("text/plain") && !text) {
       text = decodeBody(pbody, pcte);
-    } else if (pct.includes("text/html") && !text) {
-      text = decodeBody(pbody, pcte);
+    } else if (pct.includes("text/html")) {
+      if (!rawHtml) rawHtml = decodeBody(pbody, pcte);
+      if (!text) text = rawHtml;
     }
   }
-  return { text: cleanText(text, "text/plain", links), links, attachments };
+  return { text: cleanText(text, "text/plain", links), links, attachments, rawHtml };
 }
 
 function decodeBody(body: string, cte: string): string {

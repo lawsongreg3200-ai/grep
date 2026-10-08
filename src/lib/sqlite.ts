@@ -77,6 +77,25 @@ function open(): Database {
     );
     CREATE INDEX IF NOT EXISTS idx_actions_email ON actions (email_id, id DESC);
     CREATE INDEX IF NOT EXISTS idx_actions_recent ON actions (id DESC);
+    -- Slice 5: per-email URL reputation.
+    CREATE TABLE IF NOT EXISTS email_links (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email_id INTEGER NOT NULL,
+      url TEXT NOT NULL,
+      final_url TEXT NOT NULL DEFAULT '',
+      host TEXT NOT NULL DEFAULT '',
+      shortener INTEGER NOT NULL DEFAULT 0,
+      shortener_hops INTEGER NOT NULL DEFAULT 0,
+      heuristic_verdict TEXT NOT NULL DEFAULT 'safe',
+      heuristic_reason TEXT NOT NULL DEFAULT '',
+      gsb_verdict TEXT NOT NULL DEFAULT 'unavailable',
+      gsb_threats TEXT NOT NULL DEFAULT '',
+      gsb_source TEXT NOT NULL DEFAULT '',
+      combined TEXT NOT NULL DEFAULT 'safe',
+      combined_reason TEXT NOT NULL DEFAULT '',
+      checked_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_email_links_email ON email_links (email_id, id);
   `);
   // Safe migrations for DBs created before these columns/tables existed.
   const cols = db.query("PRAGMA table_info(emails)").all() as { name: string }[];
@@ -134,6 +153,39 @@ export interface ActionWithSubject extends ActionRow {
   subject: string;
 }
 
+export interface LinkRow {
+  id: number;
+  email_id: number;
+  url: string;
+  final_url: string;
+  host: string;
+  shortener: number;
+  shortener_hops: number;
+  heuristic_verdict: string; // safe | suspicious | dangerous
+  heuristic_reason: string;
+  gsb_verdict: string; // safe | dangerous | unavailable
+  gsb_threats: string; // JSON array string, as stored
+  gsb_source: string;
+  combined: string; // safe | suspicious | dangerous
+  combined_reason: string;
+  checked_at: string;
+}
+
+export interface LinkInput {
+  url: string;
+  final_url: string;
+  host: string;
+  shortener: boolean;
+  shortener_hops: number;
+  heuristic_verdict: string;
+  heuristic_reason: string;
+  gsb_verdict: string;
+  gsb_threats: string[];
+  gsb_source: string;
+  combined: string;
+  combined_reason: string;
+}
+
 /** Inserts or refreshes a scanned email; keeps the patrol status on re-scan. */
 export function upsertEmail(e: {
   message_id: string;
@@ -148,7 +200,7 @@ export function upsertEmail(e: {
   verdict: string;
   elite: string;
   explanation: string;
-}): void {
+}): number {
   const db = open();
   db.query(
     `INSERT INTO emails
@@ -175,6 +227,57 @@ export function upsertEmail(e: {
     e.elite,
     e.explanation
   );
+  const r = db.query("SELECT id FROM emails WHERE message_id = ?").get(e.message_id) as { id: number } | null;
+  return r?.id ?? 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* URL reputation (slice 5)                                            */
+/* ------------------------------------------------------------------ */
+
+/** Replace an email's link assessments (re-scan refreshes the whole set). */
+export function replaceEmailLinks(emailId: number, links: LinkInput[]): void {
+  const db = open();
+  db.query("DELETE FROM email_links WHERE email_id = ?").run(emailId);
+  for (const l of links) {
+    db.query(
+      `INSERT INTO email_links
+         (email_id, url, final_url, host, shortener, shortener_hops,
+          heuristic_verdict, heuristic_reason, gsb_verdict, gsb_threats, gsb_source,
+          combined, combined_reason)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).run(
+      emailId,
+      l.url,
+      l.final_url,
+      l.host,
+      l.shortener ? 1 : 0,
+      l.shortener_hops,
+      l.heuristic_verdict,
+      l.heuristic_reason,
+      l.gsb_verdict,
+      JSON.stringify(l.gsb_threats),
+      l.gsb_source,
+      l.combined,
+      l.combined_reason
+    );
+  }
+}
+
+/** Link assessments for one email, newest first. */
+export function listEmailLinks(emailId: number): LinkRow[] {
+  const db = open();
+  const rows = db
+    .query("SELECT * FROM email_links WHERE email_id = ? ORDER BY id ASC")
+    .all(emailId) as unknown as LinkRow[];
+  return rows;
+}
+
+/** Total executed actions in the audit log (all history, not just the bench). */
+export function countExecutedActions(): number {
+  const db = open();
+  const r = db.query("SELECT COUNT(*) AS n FROM actions WHERE status = 'executed'").get() as { n: number };
+  return r.n;
 }
 
 /** Most recent scanned emails first. */

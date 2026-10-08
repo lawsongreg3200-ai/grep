@@ -17,12 +17,16 @@ import {
   addAction,
   latestActionsByEmail,
   listActions,
+  listEmailLinks,
+  countExecutedActions,
   type EmailRow,
   type SyncMetaRow,
   type ActionRow,
   type ActionWithSubject,
+  type LinkRow,
 } from "./sqlite";
 import { runEmailSync, emailConfigured, moveMessageToSpam, type SyncResult } from "./imap";
+import { gsbConfigured } from "./urlcheck";
 
 export interface SystemStatus {
   dbConfigured: boolean;
@@ -41,6 +45,8 @@ export interface SystemStatus {
     lastError: string | null;
     scannedCount: number;
   };
+  /** Google Safe Browsing key present in env (server-only; just a boolean). */
+  gsbConfigured: boolean;
 }
 
 /** DATABASE_URL here is a 26-char Tiger code, not a usable postgres:// URL —
@@ -71,6 +77,7 @@ export const getSystemStatus = createServerFn().handler(async (): Promise<System
       lastError: meta?.last_error ?? null,
       scannedCount: storage.ok ? countEmails() : 0,
     },
+    gsbConfigured: gsbConfigured(),
   };
 });
 
@@ -155,10 +162,12 @@ export const triggerSync = createServerFn({ method: "POST" }).handler(
 );
 
 export interface ScannedInbox {
-  emails: (EmailRow & { action: ActionRow | null })[];
+  emails: (EmailRow & { action: ActionRow | null; links: LinkRow[] })[];
   sync: SyncMetaRow | null;
   /** Last ~10 audited actions for the ACTION LOG (newest first). */
   latestActions: ActionWithSubject[];
+  /** Total executed actions across ALL history (bench summary counter). */
+  executedTotal: number;
 }
 
 /** Most recent scanned emails (real messages from the mailbox scan). */
@@ -171,14 +180,20 @@ export const listScannedEmails = createServerFn().handler(async (): Promise<Scan
     sync = null;
   }
   const byId = latestActionsByEmail(emails.map((e) => e.id));
-  const withActions = emails.map((e) => ({ ...e, action: byId.get(e.id) ?? null }));
+  const withActions = emails.map((e) => ({ ...e, action: byId.get(e.id) ?? null, links: listEmailLinks(e.id) }));
   let latestActions: ActionWithSubject[] = [];
   try {
     latestActions = listActions(10);
   } catch {
     latestActions = [];
   }
-  return { emails: withActions, sync, latestActions };
+  let executedTotal = 0;
+  try {
+    executedTotal = countExecutedActions();
+  } catch {
+    executedTotal = 0;
+  }
+  return { emails: withActions, sync, latestActions, executedTotal };
 });
 
 /* ------------------------------------------------------------------ */

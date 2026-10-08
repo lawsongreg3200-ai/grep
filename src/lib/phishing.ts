@@ -19,6 +19,8 @@ export interface ParsedEmail {
   links?: string[];
   attachments?: string[];
   date?: string;
+  /** Decoded HTML body before tag-stripping — used by the slice-5 link checker. */
+  rawHtml?: string;
   sample?: boolean; // true = demo data, never a real message
 }
 
