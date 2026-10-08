@@ -60,6 +60,22 @@ interface LiveEmail {
   status: string;
   scanned_at: string;
   action: ActionRow | null;
+  links: LinkRow[];
+}
+interface LinkRow {
+  id: number;
+  url: string;
+  final_url: string;
+  host: string;
+  shortener: number;
+  shortener_hops: number;
+  heuristic_verdict: string;
+  heuristic_reason: string;
+  gsb_verdict: string;
+  gsb_source: string;
+  combined: string; // safe | suspicious | dangerous
+  combined_reason: string;
+  checked_at: string;
 }
 interface ActionRow {
   id: number;
@@ -84,6 +100,7 @@ interface ScannedInbox {
   emails: LiveEmail[];
   sync: SyncMeta | null;
   latestActions: LatestAction[];
+  executedTotal: number;
 }
 
 interface SavedConn {
@@ -123,6 +140,14 @@ function fmtWhen(iso: string | null | undefined): string {
 
 function kindLabel(kind: string): string {
   return kind === "move-to-spam" ? "MOVE TO SPAM" : kind === "dismiss" ? "DISMISS" : kind.toUpperCase();
+}
+function hostOfLink(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    const m = url.match(/^[a-z][a-z0-9+.-]*:\/\/([^/]+)/i);
+    return m ? m[1] : url.slice(0, 48);
+  }
 }
 
 function Dashboard() {
@@ -356,6 +381,32 @@ function Dashboard() {
         return `${head}\n${lines.join("\n")}\nFull log is on Inbox Patrol. Never acted without your word — that's the whole rule.`;
       }
 
+      const asksLinks =
+        ["link", "links", "dangerous", "unsafe", "suspicious", "bad host", "phish link", "scam link", "click"].some(
+          (k) => t.includes(k)
+        ) &&
+        ["which", "what", "any", "where", "link", "links", "dangerous", "unsafe", "suspicious", "safe", "click", "host", "check"].some(
+          (k) => t.includes(k)
+        );
+      if (asksLinks) {
+        const flagged = liveEmails.flatMap((e) =>
+          (e.links ?? [])
+            .filter((l) => l.combined === "suspicious" || l.combined === "dangerous")
+            .map((l) => ({ e, l }))
+        );
+        if (flagged.length) {
+          const lines = flagged.slice(0, 5).map(
+            ({ e, l }) =>
+              `• "${e.subject.slice(0, 56)}" → ${l.host || hostOfLink(l.final_url || l.url)}: ${l.combined.toUpperCase()} — ${l.combined_reason}`
+          );
+          const more = flagged.length > 5 ? `\n…and ${flagged.length - 5} more on Inbox Patrol.` : "";
+          return `Yeah, I got eyes on ${flagged.length} sketchy link${flagged.length === 1 ? "" : "s"}:\n${lines.join("\n")}${more}\nDon't click. Don't even hover. I flag, you call — but my vote's stay clear.`;
+        }
+        const anyLinks = liveEmails.some((e) => (e.links ?? []).length > 0);
+        if (anyLinks)
+          return "Checked every link on the bench — nothing dangerous, nothing even suspicious. Clean. Verdicts are built-in analysis (Google Safe Browsing isn't connected yet), straight talk.";
+        return "Nothing flagged and nothing to flag — no dangerous links on the bench right now. If a fresh sync brings links in, I'll check every one and tell you straight.";
+      }
       if (!aboutMail) return null;
       if (liveEmails.length) {
         const topMsg = topRisk
@@ -568,7 +619,7 @@ function Dashboard() {
                 </div>
                 <p className="mt-2 text-xs leading-relaxed text-dim sm:text-sm">
                   {liveEmails.length
-                    ? `Last sync ${fmtWhen(syncMeta?.last_sync_at)} — ${liveCounts.total} messages on the bench: ${liveCounts.phish} phish, ${liveCounts.suspect} suspect, ${liveCounts.safe} safe. Deebo's acted ${actionCounts.acted} time${actionCounts.acted === 1 ? "" : "s"} on your word.`
+                    ? `Last sync ${fmtWhen(syncMeta?.last_sync_at)} — ${liveCounts.total} messages on the bench: ${liveCounts.phish} phish, ${liveCounts.suspect} suspect, ${liveCounts.safe} safe. Deebo's acted ${inbox?.executedTotal ?? actionCounts.acted} time${(inbox?.executedTotal ?? actionCounts.acted) === 1 ? "" : "s"} on your word.`
                     : watchFailed
                       ? `Last sync failed (${fmtWhen(syncMeta?.last_sync_at)}): ${syncMeta?.last_error ?? "unknown reason"}. Fix the connection or hit SYNC NOW to retry — the site never breaks, the error just gets recorded.`
                       : "Connected and ready — hit SYNC NOW to scan the most recent ~50 messages. It takes a few seconds."}
@@ -594,6 +645,12 @@ function Dashboard() {
                   The most recent {liveEmails.length} messages from the mailbox, scored by the same
                   engine as the demo. Deebo proposes a move to spam for High/Medium flags — he
                   never acts without your two-step approval, and every action shows in the log.
+                </p>
+                <p className="mt-2 text-[10px] tracking-wide text-dim/60">
+                  Link check:{" "}
+                  {status?.gsbConfigured
+                    ? "built-in analysis + Google Safe Browsing"
+                    : "built-in analysis only — Google Safe Browsing not connected"}
                 </p>
                 <div className="mt-5 space-y-4">
                   {liveEmails.map((e) => (
@@ -1008,6 +1065,55 @@ function LiveEmailCard({
             </p>
           )}
           <p className="mt-1.5 text-xs leading-relaxed text-dim">{email.explanation}</p>
+          {(band === "High" || band === "Medium") && (
+            <div className="mt-3 rounded-xl border border-edge bg-night/40 px-3 py-2.5">
+              <p className="text-[10px] font-bold tracking-[0.25em] text-dim">LINK PATROL</p>
+              {email.links && email.links.length > 0 ? (
+                <ul className="mt-2 space-y-2">
+                  {email.links.map((lk) => {
+                    const finalHost = lk.host || hostOfLink(lk.final_url || lk.url);
+                    const v = lk.combined || "safe";
+                    return (
+                      <li key={lk.id} className="text-[11px] leading-snug">
+                        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+                          <span
+                            className="min-w-0 max-w-[14rem] truncate font-mono text-dim"
+                            title={lk.final_url || lk.url}
+                          >
+                            {finalHost}
+                          </span>
+                          {v === "safe" && (
+                            <span className="rounded-full bg-lime-400/15 px-2 py-0.5 text-[9px] font-bold tracking-widest text-lime-400 ring-1 ring-lime-400/50">
+                              SAFE
+                            </span>
+                          )}
+                          {v === "suspicious" && (
+                            <span className="rounded-full bg-amber-400/15 px-2 py-0.5 text-[9px] font-bold tracking-widest text-amber-400 ring-1 ring-amber-400/60">
+                              SUSPICIOUS
+                            </span>
+                          )}
+                          {v === "dangerous" && (
+                            <span className="rounded-full bg-blaze/25 px-2 py-0.5 text-[9px] font-bold tracking-widest text-blaze ring-2 ring-blaze/70">
+                              ☠ DANGEROUS
+                            </span>
+                          )}
+                        </div>
+                        {v === "dangerous" ? (
+                          <p className="mt-0.5 font-marker text-[11px] text-blaze">
+                            {lk.combined_reason} — don't click that, don't even hover.
+                          </p>
+                        ) : (
+                          <p className="mt-0.5 text-dim/80">{lk.combined_reason}</p>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              ) : (
+                <p className="mt-1.5 text-[11px] text-dim/70">No links in this message — clean.</p>
+              )}
+            </div>
+          )}
           {email.status === "pending" && flaggable && (
             <p className="mt-2 font-marker text-[11px] text-signal">
               Proposed: move to spam — Deebo acts only on your word.

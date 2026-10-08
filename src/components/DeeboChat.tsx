@@ -27,6 +27,12 @@ const ELITE_TRIGGERS = ["elite", "deep dive", "deep analysis", "full report"];
 function deeboReply(raw: string): string {
   const t = raw.toLowerCase();
   const pick = (arr: string[]) => arr[Math.floor(Math.random() * arr.length)];
+  const linkAsk =
+    (t.includes("link") || t.includes("links") || t.includes("dangerous") || t.includes("unsafe") || t.includes("suspicious")) &&
+    (t.includes("which") || t.includes("any") || t.includes("what") || t.includes("where"));
+  if (linkAsk) {
+    return "Link questions, I answer from your live inbox scan — head to the copilot dashboard and ask me \"which links are dangerous\" there, and I'll name names from the real mailbox: the email, the host, the verdict. No mailbox in this chat, so no guesses. I never make that stuff up.";
+  }
 
   if (
     t.includes("all-in-one") ||
