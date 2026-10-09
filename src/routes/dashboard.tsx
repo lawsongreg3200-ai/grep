@@ -573,8 +573,8 @@ function Dashboard() {
             <input
               value={aHandle}
               onChange={(e) => setAHandle(e.target.value)}
-              placeholder="HANDLE (3–24 letters, numbers, . _ -)"
-              aria-label="Handle"
+              placeholder="EMAIL OR HANDLE (3–64 chars — the owner signs in with their Gmail)"
+              aria-label="Email or handle"
               className="h-12 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
             />
             <input
@@ -605,9 +605,10 @@ function Dashboard() {
             </button>
           </form>
           <p className="mt-6 text-[11px] leading-relaxed text-dim/60">
-            First squad member? It takes an actual invite. No real accounts to buy — just a locked
-            gym door and Deebo checking IDs. Passwords are hashed with scrypt; your session cookie
-            is signed and expires in 30 days.
+            The beta door is invite-locked and Deebo checks IDs — you get in on the code you were
+            handed, no accounts for sale. The owner's spot is pinned to the admin address; it was
+            never first-come. Passwords are hashed with scrypt; your session cookie is signed and
+            expires in 30 days.
           </p>
           <Link to="/" className="mt-5 text-xs font-bold tracking-widest text-dim hover:text-signal">
             ← BACK TO THE FRONT DOOR
@@ -636,7 +637,7 @@ function Dashboard() {
               <span className="hidden items-center gap-1.5 rounded-full border border-signal/40 bg-signal/10 px-3 py-1.5 text-[10px] font-bold tracking-widest text-signal sm:inline-flex">
                 {me.handle.toUpperCase()}
                 <span className="text-edge">·</span>
-                {isOwner ? "OWNER" : "BETA"}
+                {isOwner ? "OWNER" : "MEMBER"}
                 <button
                   onClick={doLogout}
                   className="ml-1 underline decoration-signal/50 underline-offset-2 hover:text-blaze"
@@ -959,9 +960,10 @@ function Dashboard() {
                       isOwner ? "owner (the door-holder of this beta)" : "beta squad member"
                     } · ID #${me.id}. `
                   : ""}
-                Passwords are hashed with scrypt and a per-user salt before they touch the database.
-                Your session cookie is httpOnly, signed, and expires after 30 days — logging out
-                revokes it server-side.
+                The owner's spot is pinned to the admin address — only that handle can ever hold
+                it, and no first-come account can take it. Passwords are hashed with scrypt and a
+                per-user salt before they touch the database. Your session cookie is httpOnly,
+                signed, and expires after 30 days — logging out revokes it server-side.
               </p>
               {isOwner && (
                 <div className="mt-4 rounded-2xl border border-signal/30 bg-signal/5 p-4">

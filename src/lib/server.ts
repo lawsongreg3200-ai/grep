@@ -28,8 +28,6 @@ import {
 import { runEmailSync, emailConfigured, moveMessageToSpam, type SyncResult } from "./imap";
 import { gsbConfigured } from "./urlcheck";
 import {
-  countAccounts,
-  ownerCount,
   createAccount,
   getAccountByHandle,
   updateAccountPassword,
@@ -46,6 +44,7 @@ import {
   verifyPassword,
   passwordPolicyError,
   validateHandle,
+  isAdminHandle,
   startSession,
   endSession,
   sessionUser,
@@ -53,8 +52,10 @@ import {
 } from "./auth";
 import { randomBytes } from "node:crypto";
 
-/** The built-in bootstrap code doubles as the first account's invite when the
- *  beta has no owner yet. After that, only owner-minted invites work. */
+/** The beta circle's standing entry code (until the owner starts minting
+ *  personal invites). It is effectively multi-use — not a one-registration
+ *  bootstrap — so the owner can claim the pinned admin account even after a
+ *  member already registered. */
 function effectiveBetaCode(): string {
   return process.env.BETA_INVITE_CODE || "DEEBO-BETA-2026";
 }
@@ -214,7 +215,9 @@ function currentUser(): SessionUser | null {
   return sessionUser();
 }
 
-/** Register: needs a redeemable invite; first account = owner (bootstrap code). */
+/** Register: invite-gated. The owner role is pinned to the admin address —
+ *  registration assigns 'owner' only when the handle IS that address, and
+ *  'member' for everyone else. No first-account bootstrapping. */
 export const register = createServerFn({ method: "POST" }).handler(async ({ data }): Promise<AuthResult> => {
   const d = (data ?? {}) as Partial<{ handle: string; name: string; password: string; inviteCode: string }>;
   const handle = (d.handle || "").trim();
@@ -228,22 +231,18 @@ export const register = createServerFn({ method: "POST" }).handler(async ({ data
   if (!name) return { ok: false, error: "Tell Deebo your name so the squad knows who's who." };
   if (getAccountByHandle(handle)) return { ok: false, error: "That handle's taken. Pick another yearbook name." };
 
-  const isFirstAccount = countAccounts() === 0;
-  const isOwnerInvite = isFirstAccount
-    ? inviteCode.toUpperCase() === effectiveBetaCode().toUpperCase() && ownerCount() === 0
-    : false;
+  // Entry: the standing beta code (multi-use) or a redeemable owner-minted invite.
+  const isBetaCode = inviteCode.toUpperCase() === effectiveBetaCode().toUpperCase();
   const hasMintedInvite = inviteRedeemable(inviteCode);
-  if (!isOwnerInvite && !hasMintedInvite) {
+  if (!isBetaCode && !hasMintedInvite) {
     return { ok: false, error: "That invite code isn't on the list — check it and try again." };
   }
-  if (isOwnerInvite && !isFirstAccount) {
-    return { ok: false, error: "That invite's spent. The owner mints fresh ones now." };
-  }
+  const role: "owner" | "member" = isAdminHandle(handle) ? "owner" : "member";
   const salt = newSalt();
-  const id = createAccount({ handle, name, passwordHash: hashPassword(password, salt), passwordSalt: salt, role: isOwnerInvite ? "owner" : "member" });
-  if (!isOwnerInvite) consumeInvite(getInviteByCode(inviteCode)?.id ?? 0);
+  const id = createAccount({ handle, name, passwordHash: hashPassword(password, salt), passwordSalt: salt, role });
+  if (!isBetaCode) consumeInvite(getInviteByCode(inviteCode)?.id ?? 0);
   startSession(id);
-  return { ok: true, account: { id, handle, name, role: isOwnerInvite ? "owner" : "member" } };
+  return { ok: true, account: { id, handle, name, role } };
 });
 
 /** Login with handle + password. */

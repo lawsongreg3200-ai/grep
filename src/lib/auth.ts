@@ -31,6 +31,20 @@ const SESSION_DAYS = 30;
 const SECRET_PATH = "/home/team/shared/site/data/auth_secret";
 
 /* ------------------------------------------------------------------ */
+/* Owner pin — the owner role belongs to ONE handle: the admin address */
+/* ------------------------------------------------------------------ */
+
+/** The admin's address as the handle that owns the owner role. */
+export function adminEmail(): string {
+  return (process.env.ADMIN_EMAIL || "lawsongreg3200@gmail.com").trim().toLowerCase();
+}
+
+/** Case-insensitive check: is this handle the pinned admin address? */
+export function isAdminHandle(handle: string): boolean {
+  return handle.trim().toLowerCase() === adminEmail();
+}
+
+/* ------------------------------------------------------------------ */
 /* Signing secret (file-backed, git-ignored, never logged)             */
 /* ------------------------------------------------------------------ */
 
@@ -81,8 +95,8 @@ export function passwordPolicyError(password: string): string | null {
 
 export function validateHandle(handle: string): string | null {
   const h = handle.trim();
-  if (!/^[a-zA-Z0-9_.-]{3,24}$/.test(h)) {
-    return "Handle must be 3–24 characters: letters, numbers, dots, dashes, underscores.";
+  if (!/^[a-zA-Z0-9.@_+-]{3,64}$/.test(h)) {
+    return "Email or handle must be 3\u201364 characters: letters, numbers, and . @ _ + -.";
   }
   return null;
 }
@@ -149,7 +163,10 @@ export function sessionUser(): SessionUser | null {
     if (!row || new Date(row.expires_at).getTime() < Date.now()) return null;
     const acct = getAccountById(row.account_id);
     if (!acct) return null;
-    return { account: { id: acct.id, handle: acct.handle, name: acct.name, role: acct.role }, sessionId };
+    // Owner is pinned to the admin address — no other handle can ever act as
+    // owner, even if a stale DB row says otherwise.
+    const role: "owner" | "member" = isAdminHandle(acct.handle) ? "owner" : "member";
+    return { account: { id: acct.id, handle: acct.handle, name: acct.name, role }, sessionId };
   } catch {
     return null;
   }

@@ -474,7 +474,8 @@ export function getAccountById(id: number): AccountRow | null {
   return r ?? null;
 }
 
-/** First account in this beta bootstraps as owner via the built-in code. */
+/** Create an account with an explicit role — the caller (server.ts) decides
+ *  owner vs member from the pinned admin address; no first-account bootstrap. */
 export function createAccount(a: {
   handle: string;
   name: string;
@@ -554,17 +555,19 @@ export function listInvites(): InviteRow[] {
   const now = new Date().toISOString();
   const rows = db
     .query(
-      "SELECT * FROM invites WHERE uses_used < uses_total AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC"
+      "SELECT * FROM invites WHERE (uses_total <= 0 OR uses_used < uses_total) AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC"
     )
     .all(now) as unknown as InviteRow[];
   return rows;
 }
 
-/** True if an invite is still redeemable (unused + not expired). */
+/** True if an invite is still redeemable. uses_total <= 0 means unlimited
+ *  (the beta entry code's semantics); otherwise it must have uses left and
+ *  must not be expired. */
 export function inviteRedeemable(code: string): boolean {
   const r = getInviteByCode(code);
   if (!r) return false;
-  if (r.uses_used >= r.uses_total) return false;
+  if (r.uses_total > 0 && r.uses_used >= r.uses_total) return false;
   if (r.expires_at && r.expires_at < new Date().toISOString()) return false;
   return true;
 }
