@@ -10,8 +10,16 @@ import {
   listScannedEmails,
   approveAndAct,
   dismissEmail,
+  whoami,
+  login,
+  register,
+  logout,
+  createInvite,
+  listInvites,
+  changePassword,
   type SystemStatus,
   type ConnectionLoaded,
+  type AccountView,
 } from "~/lib/server";
 import {
   SAMPLE_EMAILS,
@@ -109,6 +117,11 @@ interface SavedConn {
   hasPassword: boolean;
   mode: "db" | "local";
 }
+interface InviteView {
+  code: string;
+  uses_total: number;
+  uses_used: number;
+}
 
 function readLS<T>(key: string): T | null {
   try {
@@ -152,11 +165,16 @@ function hostOfLink(url: string): string {
 
 function Dashboard() {
   const [gate, setGate] = useState<"loading" | "locked" | "open">("loading");
+  const [me, setMe] = useState<AccountView | null>(null);
   const [status, setStatus] = useState<SystemStatus | null>(null);
   const [tab, setTab] = useState<Tab>("inbox");
 
-  /* ---------------- beta gate ---------------- */
-  const [code, setCode] = useState("");
+  /* ---------------- auth gate ---------------- */
+  const [authMode, setAuthMode] = useState<"login" | "signup">("login");
+  const [aHandle, setAHandle] = useState("");
+  const [aName, setAName] = useState("");
+  const [aPassword, setAPassword] = useState("");
+  const [aInvite, setAInvite] = useState("");
   const [gateErr, setGateErr] = useState<string | null>(null);
   const [checking, setChecking] = useState(false);
 
@@ -169,27 +187,103 @@ function Dashboard() {
       } catch {
         /* server fn unavailable — revert to client defaults */
       }
+      let u: AccountView | null = null;
+      try {
+        u = await whoami();
+      } catch {
+        /* treat as anonymous */
+      }
       if (cancelled) return;
       setStatus(s);
-      const granted = readLS<string>(BETA_KEY) === "granted";
-      setGate(granted ? "open" : "locked");
+      setMe(u);
+      setGate(u ? "open" : "locked");
     })();
     return () => {
       cancelled = true;
     };
   }, []);
 
-  const submitCode = async (e: FormEvent) => {
+  const submitAuth = async (e: FormEvent) => {
     e.preventDefault();
-    const expected = status?.betaCode || FALLBACK_BETA;
-    if (code.trim().toUpperCase() === expected.trim().toUpperCase()) {
-      setChecking(true); // tiny beat for feel, then grant
-      setTimeout(() => {
-        writeLS(BETA_KEY, "granted");
+    if (checking) return;
+    setChecking(true);
+    setGateErr(null);
+    try {
+      const res =
+        authMode === "login"
+          ? await login({ data: { handle: aHandle, password: aPassword } })
+          : await register({ data: { handle: aHandle, name: aName, password: aPassword, inviteCode: aInvite } });
+      if (res.ok && res.account) {
+        setMe(res.account);
         setGate("open");
-      }, 450);
-    } else {
-      setGateErr("Wrong passcode. That invite code ain't in the yearbook, friend.");
+      } else {
+        setGateErr(res.error || "That didn't work — try again.");
+      }
+    } catch {
+      setGateErr("Couldn't reach the server right now — try again in a moment.");
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const doLogout = async () => {
+    try {
+      await logout();
+    } catch {
+      /* even on network failure we drop the local session view */
+    }
+    setMe(null);
+    setGate("locked");
+    setTab("inbox");
+  };
+  const isOwner = me?.role === "owner";
+
+  /* ---------------- account section ---------------- */
+  const [pwCurrent, setPwCurrent] = useState("");
+  const [pwNext, setPwNext] = useState("");
+  const [pwMsg, setPwMsg] = useState<string | null>(null);
+  const [acctMsg, setAcctMsg] = useState<string | null>(null);
+  const [invites, setInvites] = useState<InviteView[] | null>(null);
+  const [freshInvite, setFreshInvite] = useState<string | null>(null);
+  const refreshInvites = useCallback(async () => {
+    try {
+      const r = await listInvites();
+      if (r.ok) {
+        setInvites(r.invites.map((i) => ({ code: i.code, uses_total: i.uses_total, uses_used: i.uses_used })));
+      }
+    } catch {
+      /* leave list as-is */
+    }
+  }, []);
+  useEffect(() => {
+    if (gate === "open" && isOwner) refreshInvites();
+  }, [gate, isOwner, refreshInvites]);
+  const doChangePw = async (e: FormEvent) => {
+    e.preventDefault();
+    setPwMsg(null);
+    try {
+      const r = await changePassword({ data: { current: pwCurrent, next: pwNext } });
+      setPwMsg(r.ok ? "Password updated. Anything else I can school you on?" : r.error || "Couldn't update.");
+      if (r.ok) {
+        setPwCurrent("");
+        setPwNext("");
+      }
+    } catch {
+      setPwMsg("Couldn't reach the server — try again in a moment.");
+    }
+  };
+  const doMintInvite = async () => {
+    setAcctMsg(null);
+    try {
+      const r = await createInvite({ data: { usesTotal: 1, expiresInDays: 30 } });
+      if (r.ok && r.invite) {
+        setFreshInvite(r.invite);
+        await refreshInvites();
+      } else {
+        setAcctMsg(r.error || "Couldn't mint an invite right now.");
+      }
+    } catch {
+      setAcctMsg("Couldn't reach the server — try again in a moment.");
     }
   };
 
@@ -436,45 +530,86 @@ function Dashboard() {
     return (
       <div className="relative min-h-dvh overflow-hidden bg-night text-ink">
         <div className="dot-grid absolute inset-0" aria-hidden />
-        <div className="relative mx-auto flex min-h-dvh max-w-md flex-col items-center justify-center px-6 py-16 text-center">
-          <div className="glow-float h-24 w-24 overflow-hidden rounded-full border-4 border-signal">
+        <div className="relative mx-auto flex min-h-dvh max-w-md flex-col items-center justify-center px-6 py-14 text-center">
+          <div className="glow-float h-20 w-20 overflow-hidden rounded-full border-4 border-signal">
             <DeeboAvatar className="h-full w-full" />
           </div>
-          <p className="mt-6 font-marker text-2xl text-blaze">hold up. who's this?</p>
+          <p className="mt-5 font-marker text-2xl text-blaze">hold up. who's this?</p>
           <h1 className="mt-1 font-display text-4xl text-ink sm:text-5xl">
-            COPILOT <span className="text-signal">BETA</span>
+            COPILOT <span className="text-signal">ACCOUNT</span>
           </h1>
-          <p className="mt-4 max-w-sm text-sm leading-relaxed text-dim">
-            The copilot is in a free, invite-only beta. Enter the code from your invite — the beta
-            list is small and first-come; no paid accounts, no tricks.
+          <p className="mt-3 max-w-sm text-sm leading-relaxed text-dim">
+            Log in with your account — or enter an invite to create one. The beta is invite-only,
+            free, and honest: no paid accounts, no tricks.
           </p>
-          <form onSubmit={submitCode} className="mt-8 w-full">
+          <div className="mt-6 flex w-full gap-2 rounded-full border-2 border-edge bg-panel-2 p-1">
+            {(["login", "signup"] as const).map((m) => (
+              <button
+                key={m}
+                type="button"
+                onClick={() => {
+                  setAuthMode(m);
+                  setGateErr(null);
+                }}
+                className={`flex-1 rounded-full py-2 font-display text-xs tracking-wide transition-colors ${
+                  authMode === m ? "text-night" : "text-dim hover:text-signal"
+                }`}
+                style={authMode === m ? { backgroundColor: "var(--color-signal)" } : undefined}
+              >
+                {m === "login" ? "LOG IN" : "CREATE ACCOUNT"}
+              </button>
+            ))}
+          </div>
+          <form onSubmit={submitAuth} className="mt-5 w-full space-y-3">
+            {authMode === "signup" && (
+              <input
+                value={aName}
+                onChange={(e) => setAName(e.target.value)}
+                placeholder="NAME (as it goes in the yearbook)"
+                aria-label="Name"
+                className="h-12 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+              />
+            )}
             <input
-              value={code}
-              onChange={(e) => {
-                setCode(e.target.value);
-                setGateErr(null);
-              }}
-              placeholder="INVITE CODE"
-              aria-label="Invite code"
-              className="h-14 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-center font-display text-lg tracking-[0.2em] text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+              value={aHandle}
+              onChange={(e) => setAHandle(e.target.value)}
+              placeholder="HANDLE (3–24 letters, numbers, . _ -)"
+              aria-label="Handle"
+              className="h-12 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
             />
-            {gateErr && <p className="mt-3 font-marker text-sm text-blaze">{gateErr}</p>}
+            <input
+              type="password"
+              value={aPassword}
+              onChange={(e) => setAPassword(e.target.value)}
+              placeholder="PASSWORD (at least 8 characters)"
+              aria-label="Password"
+              className="h-12 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+            />
+            {authMode === "signup" && (
+              <input
+                value={aInvite}
+                onChange={(e) => setAInvite(e.target.value)}
+                placeholder="INVITE CODE"
+                aria-label="Invite code"
+                className="h-12 w-full rounded-2xl border-2 border-edge bg-panel-2 px-4 text-center font-display text-sm tracking-[0.2em] text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+              />
+            )}
+            {gateErr && <p className="font-marker text-sm text-blaze">{gateErr}</p>}
             <button
               type="submit"
               disabled={checking}
-              className="mt-4 w-full rounded-2xl py-4 font-display text-sm tracking-wide text-night transition-transform hover:scale-[1.02] active:scale-95 disabled:opacity-60"
+              className="mt-1 w-full rounded-2xl py-4 font-display text-sm tracking-wide text-night transition-transform hover:scale-[1.02] active:scale-95 disabled:opacity-60"
               style={{ backgroundColor: "var(--color-signal)" }}
             >
-              {checking ? "CHECKING…" : "ENTER THE BETA →"}
+              {checking ? "CHECKING ID…" : authMode === "login" ? "LOG IN →" : "CREATE ACCOUNT →"}
             </button>
           </form>
-          <p className="mt-8 text-[11px] text-dim/60">
-            Hold up — the invite code's on your beta invite. Lost it? The squad'll set you
-            straight. Free invite list, no real accounts to buy — just a locked gym door and
-            Deebo checking IDs.
+          <p className="mt-6 text-[11px] leading-relaxed text-dim/60">
+            First squad member? It takes an actual invite. No real accounts to buy — just a locked
+            gym door and Deebo checking IDs. Passwords are hashed with scrypt; your session cookie
+            is signed and expires in 30 days.
           </p>
-          <Link to="/" className="mt-6 text-xs font-bold tracking-widest text-dim hover:text-signal">
+          <Link to="/" className="mt-5 text-xs font-bold tracking-widest text-dim hover:text-signal">
             ← BACK TO THE FRONT DOOR
           </Link>
         </div>
@@ -497,6 +632,20 @@ function Dashboard() {
             </div>
           </div>
           <div className="flex items-center gap-3">
+            {me && (
+              <span className="hidden items-center gap-1.5 rounded-full border border-signal/40 bg-signal/10 px-3 py-1.5 text-[10px] font-bold tracking-widest text-signal sm:inline-flex">
+                {me.handle.toUpperCase()}
+                <span className="text-edge">·</span>
+                {isOwner ? "OWNER" : "BETA"}
+                <button
+                  onClick={doLogout}
+                  className="ml-1 underline decoration-signal/50 underline-offset-2 hover:text-blaze"
+                  aria-label="Log out"
+                >
+                  LOG OUT
+                </button>
+              </span>
+            )}
             <span
               className={`hidden rounded-full border px-3 py-1.5 text-[10px] font-bold tracking-widest sm:inline-block ${
                 liveEmails.length
@@ -569,6 +718,17 @@ function Dashboard() {
               give the word — APPROVE & ACT moves one flagged message to Gmail's Spam, and every
               move (or failure) lands in Deebo's action log.
             </p>
+            {inbox?.viewer === "member" && (
+              <div className="mt-6 rounded-3xl border-2 border-dashed border-edge bg-panel/40 p-6 text-center sm:p-8">
+                <p className="font-display text-lg text-ink">
+                  This bench watches the <span className="text-signal">owner's mailbox</span> — yours comes later.
+                </p>
+                <p className="mx-auto mt-2 max-w-md text-sm text-dim">
+                  You're in the beta as {me?.handle}. Deebo won't show you someone else's mail — when your own
+                  connection lands, this bench lights up for you. Chat works, hood rules apply.
+                </p>
+              </div>
+            )}
 
             {!emailConnected ? (
               <div className="mt-8 overflow-hidden rounded-3xl border-2 border-dashed border-edge bg-panel/40 p-8 text-center sm:p-12">
@@ -790,6 +950,88 @@ function Dashboard() {
               />
             </div>
 
+            {/* account */}
+            <div className="mt-6 rounded-3xl border-2 border-edge bg-panel p-6 sm:p-8">
+              <h3 className="font-display text-xl text-ink">ACCOUNT</h3>
+              <p className="mt-1 text-xs leading-relaxed text-dim">
+                {me
+                  ? `Signed in as ${me.name || me.handle} — @${me.handle}, ${
+                      isOwner ? "owner (the door-holder of this beta)" : "beta squad member"
+                    } · ID #${me.id}. `
+                  : ""}
+                Passwords are hashed with scrypt and a per-user salt before they touch the database.
+                Your session cookie is httpOnly, signed, and expires after 30 days — logging out
+                revokes it server-side.
+              </p>
+              {isOwner && (
+                <div className="mt-4 rounded-2xl border border-signal/30 bg-signal/5 p-4">
+                  <p className="font-display text-sm text-ink">MINT AN INVITE</p>
+                  <p className="mt-1 text-xs text-dim">
+                    Single-use, valid 30 days — hand it to someone you trust.
+                  </p>
+                  <div className="mt-3 flex flex-wrap items-center gap-2">
+                    <button
+                      onClick={doMintInvite}
+                      className="rounded-full bg-signal px-4 py-2 font-display text-xs tracking-wide text-night transition-transform hover:scale-105 active:scale-95"
+                    >
+                      MINT →
+                    </button>
+                    {freshInvite && (
+                      <code className="rounded-lg border border-signal/40 bg-night px-3 py-1.5 font-mono text-sm tracking-widest text-signal">
+                        {freshInvite}
+                      </code>
+                    )}
+                  </div>
+                  {acctMsg && <p className="mt-2 text-xs text-blaze">{acctMsg}</p>}
+                  {invites && invites.length > 0 && (
+                    <ul className="mt-3 space-y-1.5">
+                      {invites.map((i) => (
+                        <li key={i.code} className="flex items-center gap-2 font-mono text-xs text-dim">
+                          <span className="tracking-widest">{i.code}</span>
+                          <span className="text-[10px] text-dim/60">
+                            USED {i.uses_used}/{i.uses_total}
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                </div>
+              )}
+              <form onSubmit={doChangePw} className="mt-4 grid gap-3 sm:grid-cols-3">
+                <input
+                  type="password"
+                  value={pwCurrent}
+                  onChange={(e) => setPwCurrent(e.target.value)}
+                  placeholder="CURRENT PASSWORD"
+                  aria-label="Current password"
+                  className="h-11 rounded-xl border-2 border-edge bg-panel-2 px-3 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+                />
+                <input
+                  type="password"
+                  value={pwNext}
+                  onChange={(e) => setPwNext(e.target.value)}
+                  placeholder="NEW PASSWORD (8+ chars)"
+                  aria-label="New password"
+                  className="h-11 rounded-xl border-2 border-edge bg-panel-2 px-3 text-sm text-ink placeholder:text-dim/40 focus:border-signal focus:outline-none"
+                />
+                <button
+                  type="submit"
+                  className="h-11 rounded-xl border-2 border-signal px-4 font-display text-xs tracking-wide text-signal transition-colors hover:bg-signal hover:text-night"
+                >
+                  CHANGE PASSWORD
+                </button>
+              </form>
+              {pwMsg && <p className="mt-2 text-xs text-dim/80">{pwMsg}</p>}
+              <div className="mt-5 flex items-center justify-between border-t border-edge pt-4">
+                <p className="text-xs text-dim">Done for now?</p>
+                <button
+                  onClick={doLogout}
+                  className="rounded-full border border-blaze/60 px-4 py-2 font-display text-xs tracking-wide text-blaze transition-colors hover:bg-blaze hover:text-night"
+                >
+                  LOG OUT
+                </button>
+              </div>
+            </div>
             {/* connect email form */}
             <div className="mt-6 rounded-3xl border-2 border-edge bg-panel p-6 sm:p-8">
               <h3 className="font-display text-xl text-ink">CONNECT YOUR EMAIL</h3>

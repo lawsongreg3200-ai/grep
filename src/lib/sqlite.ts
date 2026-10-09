@@ -96,6 +96,32 @@ function open(): Database {
       checked_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_email_links_email ON email_links (email_id, id);
+    -- Slice 4: real accounts + sessions + invites (password auth).
+    CREATE TABLE IF NOT EXISTS accounts (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      handle TEXT NOT NULL UNIQUE COLLATE NOCASE,
+      name TEXT NOT NULL DEFAULT '',
+      password_hash TEXT NOT NULL,
+      password_salt TEXT NOT NULL,
+      role TEXT NOT NULL DEFAULT 'member',
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS sessions (
+      id TEXT PRIMARY KEY,
+      account_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      expires_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sessions_account ON sessions (account_id, id);
+    CREATE TABLE IF NOT EXISTS invites (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      code TEXT NOT NULL UNIQUE,
+      created_by INTEGER,
+      uses_total INTEGER NOT NULL DEFAULT 1,
+      uses_used INTEGER NOT NULL DEFAULT 0,
+      expires_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
   // Safe migrations for DBs created before these columns/tables existed.
   const cols = db.query("PRAGMA table_info(emails)").all() as { name: string }[];
@@ -395,4 +421,150 @@ export function storageHealth(): { ok: boolean; path: string; tables: number; er
   } catch (e) {
     return { ok: false, path: dbFilePath(), tables: 0, error: String((e as Error)?.message ?? e) };
   }
+}
+
+/* ------------------------------------------------------------------ */
+/* Slice 4 — accounts, sessions, invites (password auth)               */
+/* ------------------------------------------------------------------ */
+
+export interface AccountRow {
+  id: number;
+  handle: string;
+  name: string;
+  password_hash: string;
+  password_salt: string;
+  role: "owner" | "member";
+  created_at: string;
+}
+
+export interface InviteRow {
+  id: number;
+  code: string;
+  created_by: number | null;
+  uses_total: number;
+  uses_used: number;
+  expires_at: string | null;
+  created_at: string;
+}
+
+export function countAccounts(): number {
+  const db = open();
+  const r = db.query("SELECT COUNT(*) AS n FROM accounts").get() as { n: number };
+  return r.n;
+}
+
+export function ownerCount(): number {
+  const db = open();
+  const r = db.query("SELECT COUNT(*) AS n FROM accounts WHERE role = 'owner'").get() as { n: number };
+  return r.n;
+}
+
+/** Case-insensitive handle lookup. */
+export function getAccountByHandle(handle: string): AccountRow | null {
+  const db = open();
+  const r = db.query("SELECT * FROM accounts WHERE handle = ? COLLATE NOCASE").get(handle.trim()) as
+    | AccountRow
+    | null;
+  return r ?? null;
+}
+
+export function getAccountById(id: number): AccountRow | null {
+  const db = open();
+  const r = db.query("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRow | null;
+  return r ?? null;
+}
+
+/** First account in this beta bootstraps as owner via the built-in code. */
+export function createAccount(a: {
+  handle: string;
+  name: string;
+  passwordHash: string;
+  passwordSalt: string;
+  role: "owner" | "member";
+}): number {
+  const db = open();
+  const r = db
+    .query("INSERT INTO accounts (handle, name, password_hash, password_salt, role) VALUES (?, ?, ?, ?, ?)")
+    .run(a.handle.trim(), a.name.trim(), a.passwordHash, a.passwordSalt, a.role);
+  return Number(r.lastInsertRowid);
+}
+
+export function updateAccountPassword(id: number, hash: string, salt: string): void {
+  const db = open();
+  db.query("UPDATE accounts SET password_hash = ?, password_salt = ? WHERE id = ?").run(hash, salt, id);
+}
+
+export function setAccountName(id: number, name: string): void {
+  const db = open();
+  db.query("UPDATE accounts SET name = ? WHERE id = ?").run(name.trim(), id);
+}
+
+export function createSession(id: string, accountId: number, expiresAt: string): void {
+  const db = open();
+  db.query("INSERT OR REPLACE INTO sessions (id, account_id, expires_at) VALUES (?, ?, ?)").run(
+    id,
+    accountId,
+    expiresAt
+  );
+}
+
+export function getSession(id: string): { id: string; account_id: number; expires_at: string } | null {
+  const db = open();
+  const r = db.query("SELECT * FROM sessions WHERE id = ?").get(id) as
+    | { id: string; account_id: number; expires_at: string }
+    | null;
+  return r ?? null;
+}
+
+export function deleteSession(id: string): void {
+  const db = open();
+  db.query("DELETE FROM sessions WHERE id = ?").run(id);
+}
+
+/** Drop expired sessions (called at session creation; harmless sweep). */
+export function sweepExpiredSessions(): void {
+  const db = open();
+  db.query("DELETE FROM sessions WHERE expires_at < ?").run(new Date().toISOString());
+}
+
+export function mintInvite(a: { code: string; createdBy: number; usesTotal: number; expiresAt: string | null }): void {
+  const db = open();
+  db.query("INSERT INTO invites (code, created_by, uses_total, expires_at) VALUES (?, ?, ?, ?)").run(
+    a.code,
+    a.createdBy,
+    a.usesTotal,
+    a.expiresAt
+  );
+}
+
+export function getInviteByCode(code: string): InviteRow | null {
+  const db = open();
+  const r = db.query("SELECT * FROM invites WHERE code = ? COLLATE NOCASE").get(code.trim()) as InviteRow | null;
+  return r ?? null;
+}
+
+export function consumeInvite(id: number): void {
+  const db = open();
+  db.query("UPDATE invites SET uses_used = uses_used + 1 WHERE id = ?").run(id);
+}
+
+/** Unused, unexpired invites, newest first (owner's sharing list). */
+export function listInvites(): InviteRow[] {
+  const db = open();
+  const now = new Date().toISOString();
+  const rows = db
+    .query(
+      "SELECT * FROM invites WHERE uses_used < uses_total AND (expires_at IS NULL OR expires_at > ?) ORDER BY id DESC"
+    )
+    .all(now) as unknown as InviteRow[];
+  return rows;
+}
+
+/** True if an invite is still redeemable (unused + not expired). */
+export function inviteRedeemable(code: string): boolean {
+  const r = getInviteByCode(code);
+  if (!r) return false;
+  if (r.uses_used >= r.uses_total) return false;
+  if (r.expires_at && r.expires_at < new Date().toISOString()) return false;
+  return true;
 }

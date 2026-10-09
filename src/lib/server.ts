@@ -27,6 +27,41 @@ import {
 } from "./sqlite";
 import { runEmailSync, emailConfigured, moveMessageToSpam, type SyncResult } from "./imap";
 import { gsbConfigured } from "./urlcheck";
+import {
+  countAccounts,
+  ownerCount,
+  createAccount,
+  getAccountByHandle,
+  updateAccountPassword,
+  mintInvite,
+  listInvites as listInvitesRows,
+  inviteRedeemable,
+  consumeInvite,
+  getInviteByCode,
+  type InviteRow,
+} from "./sqlite";
+import {
+  hashPassword,
+  newSalt,
+  verifyPassword,
+  passwordPolicyError,
+  validateHandle,
+  startSession,
+  endSession,
+  sessionUser,
+  type SessionUser,
+} from "./auth";
+import { randomBytes } from "node:crypto";
+
+/** The built-in bootstrap code doubles as the first account's invite when the
+ *  beta has no owner yet. After that, only owner-minted invites work. */
+function effectiveBetaCode(): string {
+  return process.env.BETA_INVITE_CODE || "DEEBO-BETA-2026";
+}
+
+function newInviteCode(): string {
+  return "RD-" + randomBytes(5).toString("hex").toUpperCase();
+}
 
 export interface SystemStatus {
   dbConfigured: boolean;
@@ -153,12 +188,151 @@ export const loadConnection = createServerFn().handler(async (): Promise<Connect
 });
 
 /* ------------------------------------------------------------------ */
+/* Slice 4 — real accounts + sessions (replaces the localStorage gate) */
+/* ------------------------------------------------------------------ */
+
+export interface AccountView {
+  id: number;
+  handle: string;
+  name: string;
+  role: "owner" | "member";
+}
+
+export interface AuthResult {
+  ok: boolean;
+  error?: string;
+  account?: AccountView;
+  /** True when the caller is already the signed-in user (idempotent submit). */
+  already?: boolean;
+}
+
+function toView(u: SessionUser): AccountView {
+  return u.account;
+}
+
+function currentUser(): SessionUser | null {
+  return sessionUser();
+}
+
+/** Register: needs a redeemable invite; first account = owner (bootstrap code). */
+export const register = createServerFn({ method: "POST" }).handler(async ({ data }): Promise<AuthResult> => {
+  const d = (data ?? {}) as Partial<{ handle: string; name: string; password: string; inviteCode: string }>;
+  const handle = (d.handle || "").trim();
+  const name = (d.name || "").trim();
+  const password = d.password || "";
+  const inviteCode = (d.inviteCode || "").trim();
+  const handleErr = validateHandle(handle);
+  if (handleErr) return { ok: false, error: handleErr };
+  const pwErr = passwordPolicyError(password);
+  if (pwErr) return { ok: false, error: pwErr };
+  if (!name) return { ok: false, error: "Tell Deebo your name so the squad knows who's who." };
+  if (getAccountByHandle(handle)) return { ok: false, error: "That handle's taken. Pick another yearbook name." };
+
+  const isFirstAccount = countAccounts() === 0;
+  const isOwnerInvite = isFirstAccount
+    ? inviteCode.toUpperCase() === effectiveBetaCode().toUpperCase() && ownerCount() === 0
+    : false;
+  const hasMintedInvite = inviteRedeemable(inviteCode);
+  if (!isOwnerInvite && !hasMintedInvite) {
+    return { ok: false, error: "That invite code isn't on the list — check it and try again." };
+  }
+  if (isOwnerInvite && !isFirstAccount) {
+    return { ok: false, error: "That invite's spent. The owner mints fresh ones now." };
+  }
+  const salt = newSalt();
+  const id = createAccount({ handle, name, passwordHash: hashPassword(password, salt), passwordSalt: salt, role: isOwnerInvite ? "owner" : "member" });
+  if (!isOwnerInvite) consumeInvite(getInviteByCode(inviteCode)?.id ?? 0);
+  startSession(id);
+  return { ok: true, account: { id, handle, name, role: isOwnerInvite ? "owner" : "member" } };
+});
+
+/** Login with handle + password. */
+export const login = createServerFn({ method: "POST" }).handler(async ({ data }): Promise<AuthResult> => {
+  const d = (data ?? {}) as Partial<{ handle: string; password: string }>;
+  const handle = (d.handle || "").trim();
+  const password = d.password || "";
+  const acct = getAccountByHandle(handle);
+  if (!acct || !verifyPassword(password, acct.password_salt, acct.password_hash)) {
+    return { ok: false, error: "Handle or password didn't match. Deebo's got a great memory — try again." };
+  }
+  startSession(acct.id);
+  return { ok: true, account: { id: acct.id, handle: acct.handle, name: acct.name, role: acct.role } };
+});
+
+/** Log out: revoke the session row and clear the cookie. */
+export const logout = createServerFn({ method: "POST" }).handler(async (): Promise<{ ok: boolean }> => {
+  try {
+    endSession();
+  } catch {
+    /* already gone */
+  }
+  return { ok: true };
+});
+
+/** Who am I? Drives the gate on the client. */
+export const whoami = createServerFn().handler(async (): Promise<AccountView | null> => {
+  const u = currentUser();
+  return u ? toView(u) : null;
+});
+
+/** Owner-only: mint an invite code to share. */
+export const createInvite = createServerFn({ method: "POST" }).handler(async ({ data }): Promise<AuthResult & { invite?: string }> => {
+  const u = currentUser();
+  if (!u) return { ok: false, error: "You need to be logged in for that." };
+  if (u.account.role !== "owner") return { ok: false, error: "Only the owner can hand out invite codes." };
+  const d = (data ?? {}) as Partial<{ usesTotal: number; expiresInDays: number }>;
+  const usesTotal = Math.min(Math.max(Number(d.usesTotal) || 1, 1), 25);
+  const expDays = Number(d.expiresInDays) || 0;
+  const expiresAt = expDays > 0 ? new Date(Date.now() + expDays * 86400000).toISOString() : null;
+  const code = newInviteCode();
+  mintInvite({ code, createdBy: u.account.id, usesTotal, expiresAt });
+  return { ok: true, invite: code };
+});
+
+/** Owner-only: unused invite codes for sharing. */
+export const listInvites = createServerFn().handler(async (): Promise<{ ok: boolean; invites: InviteRow[]; error?: string }> => {
+  const u = currentUser();
+  if (!u) return { ok: false, invites: [], error: "You need to be logged in for that." };
+  if (u.account.role !== "owner") return { ok: false, invites: [], error: "Only the owner can see invites." };
+  const invites = listInvitesRows().map((i) => ({ ...i }));
+  return { ok: true, invites };
+});
+
+/** Owner-only: change password (verifies the current one first). */
+export const changePassword = createServerFn({ method: "POST" }).handler(
+  async ({ data }): Promise<{ ok: boolean; error?: string }> => {
+    const u = currentUser();
+    if (!u) return { ok: false, error: "Not logged in." };
+    const d = (data ?? {}) as Partial<{ current: string; next: string }>;
+    const acct = getAccountByHandle(u.account.handle);
+    if (!acct || !verifyPassword(d.current || "", acct.password_salt, acct.password_hash)) {
+      return { ok: false, error: "Current password didn't match." };
+    }
+    const pwErr = passwordPolicyError(d.next || "");
+    if (pwErr) return { ok: false, error: pwErr };
+    const salt = newSalt();
+    updateAccountPassword(acct.id, hashPassword(d.next || "", salt), salt);
+    return { ok: true };
+  }
+);
+
+/* ------------------------------------------------------------------ */
 /* Live email watch                                                    */
 /* ------------------------------------------------------------------ */
 
-/** On-demand IMAP refresh. Bound to ~22s; failures are recorded, never thrown. */
+/** On-demand IMAP refresh. Bound to ~22s; failures are recorded, never thrown.
+ *  Owner-scoped: the watch runs against the owner's mailbox only. */
 export const triggerSync = createServerFn({ method: "POST" }).handler(
-  async (): Promise<SyncResult> => runEmailSync()
+  async (): Promise<SyncResult> => {
+    const u = currentUser();
+    if (!u) {
+      return { ok: false, stored: 0, durationMs: 0, error: "You need to be logged in for that." };
+    }
+    if (u.account.role !== "owner") {
+      return { ok: false, stored: 0, durationMs: 0, error: "The beta watch covers the owner's mailbox — your own connection comes later." };
+    }
+    return runEmailSync();
+  }
 );
 
 export interface ScannedInbox {
@@ -168,10 +342,19 @@ export interface ScannedInbox {
   latestActions: ActionWithSubject[];
   /** Total executed actions across ALL history (bench summary counter). */
   executedTotal: number;
+  /** Who is looking (owner sees data; members see the friendly beta state). */
+  viewer: "owner" | "member" | "anon";
 }
 
-/** Most recent scanned emails (real messages from the mailbox scan). */
+/** Most recent scanned emails (real messages from the mailbox scan).
+ *  Owner-scoped: members/anon never see mailbox content — they get an empty
+ *  bench plus the viewer role so the UI can explain the beta honestly. */
 export const listScannedEmails = createServerFn().handler(async (): Promise<ScannedInbox> => {
+  const u = currentUser();
+  if (!u) return { emails: [], sync: null, latestActions: [], executedTotal: 0, viewer: "anon" };
+  if (u.account.role !== "owner") {
+    return { emails: [], sync: null, latestActions: [], executedTotal: 0, viewer: "member" };
+  }
   const emails = listEmails(50);
   let sync: SyncMetaRow | null = null;
   try {
@@ -193,7 +376,7 @@ export const listScannedEmails = createServerFn().handler(async (): Promise<Scan
   } catch {
     executedTotal = 0;
   }
-  return { emails: withActions, sync, latestActions, executedTotal };
+  return { emails: withActions, sync, latestActions, executedTotal, viewer: "owner" };
 });
 
 /* ------------------------------------------------------------------ */
@@ -222,6 +405,11 @@ export interface ActResult {
  */
 export const approveAndAct = createServerFn({ method: "POST" }).handler(
   async ({ data }): Promise<ActResult> => {
+    const u = currentUser();
+    if (!u) return { ok: false, emailId: 0, subject: "", status: "failed", error: "You need to be logged in for that." };
+    if (u.account.role !== "owner") {
+      return { ok: false, emailId: 0, subject: "", status: "failed", error: "Only the owner approves actions in this beta." };
+    }
     const emailId = Number((data as { emailId?: unknown } | null)?.emailId);
     if (!Number.isInteger(emailId) || emailId <= 0) {
       return { ok: false, emailId, subject: "", status: "failed", error: "Invalid email id." };
@@ -313,6 +501,11 @@ export const approveAndAct = createServerFn({ method: "POST" }).handler(
 /** Owner says this one's fine — NO mailbox action, just audit-logged. */
 export const dismissEmail = createServerFn({ method: "POST" }).handler(
   async ({ data }): Promise<ActResult> => {
+    const u = currentUser();
+    if (!u) return { ok: false, emailId: 0, subject: "", status: "failed", error: "You need to be logged in for that." };
+    if (u.account.role !== "owner") {
+      return { ok: false, emailId: 0, subject: "", status: "failed", error: "Only the owner dismisses messages in this beta." };
+    }
     const emailId = Number((data as { emailId?: unknown } | null)?.emailId);
     if (!Number.isInteger(emailId) || emailId <= 0) {
       return { ok: false, emailId, subject: "", status: "failed", error: "Invalid email id." };
