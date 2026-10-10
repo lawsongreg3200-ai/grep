@@ -370,8 +370,24 @@ export async function gsbThreatMatches(urls: string[]): Promise<GsbBatchResult> 
   const unique = [...new Set(urls)];
   if (!unique.length) return { map };
   try {
-    for (let i = 0; i < unique.length; i += GSB_BATCH_MAX) {
-      const chunk = unique.slice(i, i + GSB_BATCH_MAX);
+    // Normalize to absolute http(s) URLs. GSB rejects a batch outright (HTTP
+    // 400) if ANY entry is malformed (unencoded spaces/control chars,
+    // protocol-relative, mailto:, etc.), which would otherwise fail the whole
+    // sync's verdict set. Unparseable links keep their heuristic verdict.
+    const entries = unique
+      .map((u) => {
+        try {
+          const p = new URL(u);
+          if (p.protocol !== "http:" && p.protocol !== "https:") return null;
+          return p.href;
+        } catch {
+          return null;
+        }
+      })
+      .filter((x): x is string => x !== null);
+    if (!entries.length) return { map };
+    for (let i = 0; i < entries.length; i += GSB_BATCH_MAX) {
+      const chunk = entries.slice(i, i + GSB_BATCH_MAX);
       const res = await fetch(`${GSB_ENDPOINT}?key=${encodeURIComponent(key)}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
