@@ -17,9 +17,13 @@ import {
   createInvite,
   listInvites,
   changePassword,
+  listInviteCardsFn,
+  toggleInviteCard,
+  setInviteLabel,
   type SystemStatus,
   type ConnectionLoaded,
   type AccountView,
+  type InviteCardRow,
 } from "~/lib/server";
 import {
   SAMPLE_EMAILS,
@@ -49,7 +53,7 @@ const BETA_KEY = "deebo.beta.v1";
 const SETTINGS_KEY = "deebo.settings.v1";
 const FALLBACK_BETA = "DEEBO-BETA-2026";
 
-type Tab = "inbox" | "chat" | "settings";
+type Tab = "inbox" | "chat" | "settings" | "roster";
 
 /** JSON-safe shape of a scanned real email as returned by listScannedEmails. */
 interface LiveEmail {
@@ -287,6 +291,54 @@ function Dashboard() {
     }
   };
 
+  /* ---------------- invite roster (slice 4b) ---------------- */
+  const [cards, setCards] = useState<InviteCardRow[] | null>(null);
+  const [cardLabels, setCardLabels] = useState<Record<number, string>>({});
+  const [rosterMsg, setRosterMsg] = useState<string | null>(null);
+  const refreshRoster = useCallback(async () => {
+    try {
+      const r = await listInviteCardsFn();
+      if (r.ok && r.cards) {
+        setCards(r.cards);
+        setCardLabels((prev) => {
+          const next: Record<number, string> = { ...prev };
+          for (const c of r.cards) if (!(c.num in next)) next[c.num] = c.label;
+          return next;
+        });
+        setRosterMsg(null);
+      } else {
+        setCards(null);
+        setRosterMsg(r.error || "The invite roster is owner-locked.");
+      }
+    } catch {
+      /* leave as-is */
+    }
+  }, []);
+  useEffect(() => {
+    if (gate === "open" && isOwner) refreshRoster();
+  }, [gate, isOwner, refreshRoster]);
+  const doCross = async (num: number) => {
+    try {
+      const r = await toggleInviteCard({ data: { num } });
+      if (r.ok) {
+        setCards((prev) =>
+          prev ? prev.map((c) => (c.num === num ? { ...c, crossed: r.crossed ?? (c.crossed ? 0 : 1) } : c)) : prev
+        );
+      } else {
+        setRosterMsg(r.error || "Couldn't update the board.");
+      }
+    } catch {
+      setRosterMsg("Couldn't reach the server right now.");
+    }
+  };
+  const saveCardLabel = async (num: number, label: string) => {
+    try {
+      const r = await setInviteLabel({ data: { num, label } });
+      if (!r.ok) setRosterMsg(r.error || "Couldn't stick that label on the card.");
+    } catch {
+      setRosterMsg("Couldn't reach the server right now.");
+    }
+  };
   /* ---------------- settings / connection ---------------- */
   const [savedConn, setSavedConn] = useState<SavedConn | null>(null);
   const [form, setForm] = useState({ provider: "gmail", email: "", appPassword: "" });
@@ -675,6 +727,7 @@ function Dashboard() {
             [
               ["inbox", "📥 INBOX PATROL"],
               ["chat", "💬 DEEBO CHAT"],
+              ...(isOwner ? ([["roster", "🎟 INVITE ROSTER"]] as [Tab, string][]) : []),
               ["settings", "⚙️ SETTINGS"],
             ] as [Tab, string][]
           ).map(([id, label]) => (
@@ -886,6 +939,87 @@ function Dashboard() {
         )}
 
         {/* ============ DEEBO CHAT ============ */}
+        {tab === "roster" && (
+          <section>
+            <p className="font-marker text-xl text-blaze sm:text-2xl">roll call — stick to each number…</p>
+            <h2 className="mt-1 font-display text-3xl text-ink sm:text-5xl">
+              INVITE <span className="text-signal">ROSTER</span>
+            </h2>
+            {!isOwner ? (
+              <p className="mt-4 rounded-xl border border-edge bg-panel/70 p-4 font-marker text-ink">
+                This board is owner-locked. The invite codes stay on it — nobody else sees them.
+              </p>
+            ) : cards === null ? (
+              <p className="mt-4 text-dim">Pulling up the board…</p>
+            ) : (
+              <>
+                <p className="mt-3 max-w-3xl text-sm text-dim">
+                  A tracking board — nothing runs on it. Cross a number out when you hand it off,
+                  stick a name on the card so you remember who's got it. <b>USED</b> means that invite
+                  is already consumed in the live invites table (read live, never a stale copy).
+                </p>
+                {rosterMsg && (
+                  <p className="mt-3 rounded-lg border border-blaze/40 bg-blaze/10 px-3 py-2 text-xs text-blaze">{rosterMsg}</p>
+                )}
+                <div className="mt-5 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
+                  {cards.map((c) => {
+                    const crossed = c.crossed === 1;
+                    const used = c.used === 1;
+                    const label = cardLabels[c.num] ?? c.label;
+                    return (
+                      <div
+                        key={c.num}
+                        className={`relative flex flex-col gap-2 rounded-xl border bg-panel/80 p-3 transition-colors ${
+                          used
+                            ? "border-blaze/70"
+                            : crossed
+                              ? "border-edge opacity-70"
+                              : "border-edge hover:border-signal/60"
+                        }`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className={`font-display text-3xl text-ink ${crossed ? "line-through decoration-blaze decoration-4" : ""}`}>
+                            {String(c.num).padStart(2, "0")}
+                          </span>
+                          {used ? (
+                            <span className="rounded-full bg-blaze px-2 py-0.5 font-display text-[10px] font-bold tracking-widest text-night">
+                              USED
+                            </span>
+                          ) : crossed ? (
+                            <span className="rounded-full bg-ink px-2 py-0.5 font-display text-[10px] font-bold tracking-widest text-panel">
+                              CROSSED
+                            </span>
+                          ) : null}
+                        </div>
+                        <p className={`font-mono text-xs tracking-wider ${crossed ? "text-dim line-through decoration-blaze decoration-2" : "text-ink"}`}>
+                          {c.code}
+                        </p>
+                        <input
+                          value={label}
+                          onChange={(e) => setCardLabels((prev) => ({ ...prev, [c.num]: e.target.value }))}
+                          onBlur={() => saveCardLabel(c.num, label)}
+                          placeholder="WHO'S GOT IT?"
+                          maxLength={80}
+                          className="w-full rounded-lg border border-edge bg-night/60 px-2 py-1.5 font-marker text-sm text-ink placeholder:text-dim/50 focus:border-signal focus:outline-none"
+                        />
+                        <button
+                          onClick={() => doCross(c.num)}
+                          className={`rounded-lg px-3 py-1.5 font-display text-[11px] font-bold tracking-widest transition-colors ${
+                            crossed
+                              ? "border border-edge text-dim hover:border-signal hover:text-signal"
+                              : "bg-blaze text-night hover:bg-blaze/85"
+                          }`}
+                        >
+                          {crossed ? "RESTORE" : "✖ CROSS OUT"}
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </section>
+        )}
         {tab === "chat" && (
           <section>
             <p className="font-marker text-xl text-blaze sm:text-2xl">his office hours…</p>

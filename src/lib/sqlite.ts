@@ -31,6 +31,26 @@ export function dbFilePath(): string {
 
 let _db: Database | null = null;
 
+/** The owner's 32 numbered hand-out invites (owner id 3, single-use, no expiry).
+ *  Seeds the invites table once and drives the invite_cards tracking board. */
+export const INVITE_ROSTER: { num: number; code: string }[] = [
+  { num: 1, code: "RD-A60A191085" }, { num: 2, code: "RD-E5E45CFC3F" },
+  { num: 3, code: "RD-4F89475DAC" }, { num: 4, code: "RD-960DCF3888" },
+  { num: 5, code: "RD-8C4A1D9E3C" }, { num: 6, code: "RD-04EF568F15" },
+  { num: 7, code: "RD-BDC675E774" }, { num: 8, code: "RD-88A10DEAFE" },
+  { num: 9, code: "RD-7729F1E6CC" }, { num: 10, code: "RD-887FC0341C" },
+  { num: 11, code: "RD-7FEB9C06BE" }, { num: 12, code: "RD-99CB9675BC" },
+  { num: 13, code: "RD-2EC7586411" }, { num: 14, code: "RD-DB85581F99" },
+  { num: 15, code: "RD-D1EE31EA8E" }, { num: 16, code: "RD-0418E5DCD5" },
+  { num: 17, code: "RD-053F48A8E3" }, { num: 18, code: "RD-C8524F3B19" },
+  { num: 19, code: "RD-6BB56D365D" }, { num: 20, code: "RD-3BED39FED2" },
+  { num: 21, code: "RD-5A756426A4" }, { num: 22, code: "RD-F696275EC7" },
+  { num: 23, code: "RD-6120EE2B5F" }, { num: 24, code: "RD-FB315FA4B0" },
+  { num: 25, code: "RD-C3B472CF23" }, { num: 26, code: "RD-4A62E72548" },
+  { num: 27, code: "RD-40813CFF02" }, { num: 28, code: "RD-C2E8A72AF0" },
+  { num: 29, code: "RD-1AC19DDCA9" }, { num: 30, code: "RD-0F8241A1BA" },
+  { num: 31, code: "RD-7182BEE610" }, { num: 32, code: "RD-67B868467D" },
+];
 /** Lazily open (and initialize/migrate) the sqlite database. Throws on real IO failure. */
 function open(): Database {
   if (_db) return _db;
@@ -122,6 +142,15 @@ function open(): Database {
       expires_at TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+    -- Slice 4b: the owner's 32-card hand-out tracking board (stick to each
+    -- number, cross it out). 'used' is derived LIVE from invites.uses_used by
+    -- code — nothing in this table claims to be consumption state.
+    CREATE TABLE IF NOT EXISTS invite_cards (
+      num INTEGER PRIMARY KEY,
+      code TEXT NOT NULL UNIQUE,
+      label TEXT NOT NULL DEFAULT '',
+      crossed INTEGER NOT NULL DEFAULT 0
+    );
   `);
   // Safe migrations for DBs created before these columns/tables existed.
   const cols = db.query("PRAGMA table_info(emails)").all() as { name: string }[];
@@ -130,6 +159,19 @@ function open(): Database {
   }
   if (!cols.some((c) => c.name === "imap_uid")) {
     db.exec("ALTER TABLE emails ADD COLUMN imap_uid INTEGER");
+  }
+  // Seed the owner's 32 invites and matching cards (idempotent: INSERT OR
+  // IGNORE keeps existing labels/crossed state and never re-mints consumed
+  // codes). #1 starts crossed — the first card went out.
+  const seedInvite = db.prepare(
+    "INSERT OR IGNORE INTO invites (code, created_by, uses_total, uses_used, expires_at) VALUES (?, 3, 1, 0, NULL)"
+  );
+  const seedCard = db.prepare(
+    "INSERT OR IGNORE INTO invite_cards (num, code, label, crossed) VALUES (?, ?, '', ?)"
+  );
+  for (const { num, code } of INVITE_ROSTER) {
+    seedInvite.run(code);
+    seedCard.run(num, code, num === 1 ? 1 : 0);
   }
   _db = db;
   return db;
@@ -570,4 +612,40 @@ export function inviteRedeemable(code: string): boolean {
   if (r.uses_total > 0 && r.uses_used >= r.uses_total) return false;
   if (r.expires_at && r.expires_at < new Date().toISOString()) return false;
   return true;
+}
+/* ---------------- invite roster (slice 4b: tracking board) ---------------- */
+export interface InviteCardRow {
+  num: number;
+  code: string;
+  label: string;
+  /** 1 = crossed out on the board (handed out), 0 = still on the wall. */
+  crossed: number;
+  /** Derived LIVE from invites.uses_used by code — never a stored copy. */
+  used: number;
+}
+export function listInviteCards(): InviteCardRow[] {
+  return open()
+    .query(
+      `SELECT c.num, c.code, c.label, c.crossed,
+              CASE WHEN COALESCE((SELECT i.uses_used FROM invites i WHERE i.code = c.code), 0) > 0 THEN 1 ELSE 0 END AS used
+         FROM invite_cards c ORDER BY c.num`
+    )
+    .all() as unknown as InviteCardRow[];
+}
+export function getInviteCard(num: number): InviteCardRow | null {
+  return (
+    (open()
+      .query(
+        `SELECT c.num, c.code, c.label, c.crossed,
+                CASE WHEN COALESCE((SELECT i.uses_used FROM invites i WHERE i.code = c.code), 0) > 0 THEN 1 ELSE 0 END AS used
+           FROM invite_cards c WHERE c.num = ?`
+      )
+      .get(num) as InviteCardRow | null) ?? null
+  );
+}
+export function setInviteCardCrossed(num: number, crossed: 0 | 1): void {
+  open().query("UPDATE invite_cards SET crossed = ? WHERE num = ?").run(crossed, num);
+}
+export function setInviteCardLabel(num: number, label: string): void {
+  open().query("UPDATE invite_cards SET label = ? WHERE num = ?").run(label.slice(0, 80), num);
 }

@@ -36,7 +36,12 @@ import {
   inviteRedeemable,
   consumeInvite,
   getInviteByCode,
+  listInviteCards as listInviteCardsRows,
+  getInviteCard,
+  setInviteCardCrossed,
+  setInviteCardLabel,
   type InviteRow,
+  type InviteCardRow,
 } from "./sqlite";
 import {
   hashPassword,
@@ -296,6 +301,50 @@ export const listInvites = createServerFn().handler(async (): Promise<{ ok: bool
   const invites = listInvitesRows().map((i) => ({ ...i }));
   return { ok: true, invites };
 });
+/* ---------------- invite roster (slice 4b) ---------------- */
+/** Owner-only: the 32-card tracking board. Members/anon get a locked note —
+ *  never the codes. 'used' is derived live from invites.uses_used by code.
+ *  Honest framing: this is a paper-style board, nothing runs on it. */
+export const listInviteCardsFn = createServerFn().handler(
+  async (): Promise<{ ok: boolean; locked?: boolean; cards?: InviteCardRow[]; error?: string }> => {
+    const u = currentUser();
+    if (!u || u.account.role !== "owner") {
+      return { ok: false, locked: true, error: "The invite roster is owner-locked." };
+    }
+    return { ok: true, cards: listInviteCardsRows() };
+  }
+);
+/** Owner-only: cross out / restore one card. */
+export const toggleInviteCard = createServerFn({ method: "POST" }).handler(
+  async ({ data }): Promise<{ ok: boolean; locked?: boolean; crossed?: 0 | 1; error?: string }> => {
+    const u = currentUser();
+    if (!u || u.account.role !== "owner") {
+      return { ok: false, locked: true, error: "Only the owner runs this board." };
+    }
+    const num = Number((data as { num?: number } | undefined)?.num);
+    const card = getInviteCard(num);
+    if (!card) return { ok: false, error: `No card #${num} on the roster.` };
+    const crossed: 0 | 1 = card.crossed ? 0 : 1;
+    setInviteCardCrossed(num, crossed);
+    return { ok: true, crossed };
+  }
+);
+/** Owner-only: stick a name (or note) on a card. */
+export const setInviteLabel = createServerFn({ method: "POST" }).handler(
+  async ({ data }): Promise<{ ok: boolean; locked?: boolean; label?: string; error?: string }> => {
+    const u = currentUser();
+    if (!u || u.account.role !== "owner") {
+      return { ok: false, locked: true, error: "Only the owner runs this board." };
+    }
+    const d = (data ?? {}) as { num?: number; label?: string };
+    const num = Number(d.num);
+    const card = getInviteCard(num);
+    if (!card) return { ok: false, error: `No card #${num} on the roster.` };
+    const label = String(d.label ?? "").slice(0, 80);
+    setInviteCardLabel(num, label);
+    return { ok: true, label };
+  }
+);
 
 /** Owner-only: change password (verifies the current one first). */
 export const changePassword = createServerFn({ method: "POST" }).handler(
