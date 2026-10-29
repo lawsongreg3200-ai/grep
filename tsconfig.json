@@ -1,5 +1,10 @@
 {
   "include": ["**/*.ts", "**/*.tsx"],
+  // `convex/` is its own TypeScript project (convex/tsconfig.json) and needs
+  // Convex-generated types (`convex/_generated/`) that only exist after a
+  // codegen run against a real deployment. Keeping it out of the app's
+  // typecheck keeps the site green; see convex/README.md.
+  "exclude": ["node_modules", "dist", "convex"],
   "compilerOptions": {
     "target": "ES2022",
     "jsx": "react-jsx",

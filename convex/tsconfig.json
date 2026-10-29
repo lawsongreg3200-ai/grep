@@ -1,0 +1,28 @@
+{
+  /* TypeScript project for the Convex functions. This is Convex's standard
+   * config (what `npx convex codegen --init` writes) — it describes the
+   * environment the functions run in, not the Vite app.
+   *
+   * The app's own typecheck is the root tsconfig, which EXCLUDES this
+   * directory on purpose: `convex/_generated/` does not exist until codegen
+   * has run against a real deployment, so including it in the app's
+   * `tsc --noEmit` would fail for a reason that has nothing to do with the
+   * site. See convex/README.md → "Typechecking".
+   */
+  "compilerOptions": {
+    "allowJs": true,
+    "strict": true,
+    "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
+    "skipLibCheck": true,
+    "allowSyntheticDefaultImports": true,
+    "target": "ESNext",
+    "lib": ["ES2021", "dom"],
+    "forceConsistentCasingInFileNames": true,
+    "module": "ESNext",
+    "isolatedModules": true,
+    "noEmit": true
+  },
+  "include": ["./**/*"],
+  "exclude": ["./_generated"]
+}
