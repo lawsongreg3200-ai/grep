@@ -4,10 +4,11 @@ Scaffold for the Convex Cloud backend: a durable database, a genuinely public
 HTTPS REST surface, and scheduled functions so the email watcher runs on a timer
 instead of only when someone presses **SYNC NOW**.
 
-> **Status: written, not deployed, not exercised.** There is no Convex deploy
-> key yet, so none of these endpoints has ever run. Nothing here is live, and
-> the site's runtime does not call it. Treat every claim in this file as
-> "intended behaviour, to be verified on first deploy".
+> **Status: deployed to the DEV deployment (`modest-donkey-711`), not production,
+> and not reachable yet.** The phishing scorer is ported and runs; the IMAP fetch
+> and the URL-reputation check are not. `DEEBO_API_KEY` is still unset on the
+> deployment, so every HTTP route returns 401 by design and no endpoint has been
+> exercised end-to-end. The site's runtime does not call any of this.
 
 ---
 
@@ -21,6 +22,8 @@ instead of only when someone presses **SYNC NOW**.
 | `http.ts` | Mount point — Convex looks for this file and takes its default export as the router. It just re-exports the router from `watch.ts`. |
 | `crons.ts` | Runs `runWatchPass` every 5 minutes. |
 | `lib/secrets.ts` | AES-256-GCM sealing for the email app password before it is stored in `watches`. |
+| `lib/phishing.ts` | **Ported** phishing heuristic scorer — pure functions, Web-standard APIs only, no network / no env vars. Faithful port of `src/lib/phishing.ts`. |
+| `scripts/score_fixtures.ts` | Dev tool: scores four fixtures with the ported module, no deployment needed. `bun run convex/scripts/score_fixtures.ts`. |
 
 Everything in `chat.ts` is `internal*`: the **only** public door is the HTTP
 router, and every route on it requires the shared secret. The deployment's
@@ -88,7 +91,7 @@ So the public endpoints are:
 ```
 GET  https://<deployment>.convex.site/health      → { ok, service: "robo-deebo", time }
 POST https://<deployment>.convex.site/chat        → { ok, sessionId, reply }
-POST https://<deployment>.convex.site/watch/run   → { ok, scanned, flagged }
+POST https://<deployment>.convex.site/watch/run   → { ok, scanned, flagged, unscored }
 ```
 
 All three require:
@@ -123,26 +126,44 @@ file changes.
 ```bash
 curl -s -X POST https://<deployment>.convex.site/watch/run \
   -H "X-Deebo-Key: $DEEBO_API_KEY"
-# → {"ok":true,"scanned":0,"flagged":0}
+# → {"ok":true,"scanned":0,"flagged":0,"unscored":1}
 ```
 
-Runs one watch pass now (same code path the cron uses). Today it walks the
-enabled `watches`, stamps `lastRunAt`, and writes one `scans` row with
-`verdict: "unscored"` — honest, because **nothing is fetched or scored yet**.
-`scanned`/`flagged` are hard-coded `0` until the pipeline is ported.
+Runs one watch pass now (same code path the cron uses). It walks the enabled
+`watches`, stamps `lastRunAt`, and **scores every message it is handed** via
+`args.messages` (see `runWatchPass`), writing the real verdict and score into
+`scans`.
+
+The HTTP route and the cron pass **no messages**, because IMAP is not ported
+yet — so today they write one `scans` row with `verdict: "unscored"`. That is
+intentional and honest: nothing was fetched, so nothing was scored, so it must
+never read as an all-clear. Counts: `scanned` = messages actually scored,
+`flagged` = those landing `phish` or `suspect`, `unscored` = messages with no
+content to score.
 
 ---
 
 ## What is NOT done yet
 
-### 1. The email-watch pipeline is not ported
-`runWatchPass` has a marked `TODO(port)` block. To finish it:
-- `src/lib/imap.ts` `runEmailSync()` → becomes an `action` with `"use node"`
-  (imapflow needs real sockets); DB writes move into the mutation.
-- `src/lib/phishing.ts` `scoreEmail()` → per-message score, band, explanation.
-- `src/lib/urlcheck.ts` → Google Safe Browsing per link.
-- One `scans` row per message, deduped on `by_message_id` (Message-ID is the
-  identity, same rule as SQLite).
+### 1. The email-watch pipeline is HALF ported: scoring yes, fetching no
+**Done:** `src/lib/phishing.ts` `scoreEmail()` → `convex/lib/phishing.ts`, a
+pure, dependency-free port (no network, no `process.env`, Web APIs only). Same
+signal set, same weights, same thresholds, same explanation voice — verified
+byte-identical on 7 fixtures (3 `SAMPLE_EMAILS` + 4 hand-built) against the site
+module: same score, band, certainty, action, explanation and signal array.
+`runWatchPass` scores every message in `args.messages` and writes the real
+verdict (`Low ⇒ safe`, `Medium ⇒ suspect`, `High|Critical ⇒ phish`, identical
+to `src/lib/imap.ts`), deduped on `by_message_id`.
+
+**Not done — marked `TODO(port)` in `watch.ts`:**
+- `src/lib/imap.ts` `runEmailSync()` — the actual fetch. Needs the owner's real
+  email connection, which we do not have. When it lands, `runWatchPass` becomes
+  an `action` with `"use node"` (imapflow needs real sockets) that fetches, then
+  calls the scoring mutation with the parsed messages. Until then the cron and
+  `POST /watch/run` have no messages to score and record `"unscored"`.
+- `src/lib/urlcheck.ts` — Google Safe Browsing per link. Needs the deployment
+  env var `SAFEBROWSING_API_KEY`, which cannot be set yet (the deploy key we
+  have carries only `deployment:deploy`). Link scoring today is heuristic-only.
 
 ### 2. The ELITE responder is not ported
 See `replyFor()` in `chat.ts`. The live behaviour to port is `eliteReply()`:
@@ -162,6 +183,17 @@ Cutting the site over to `/chat` is a separate, reversible change.
 
 ---
 
+## Checking the scorer without a deployment
+The scorer is pure, so it needs neither a deployment nor a key:
+```bash
+cd /home/team/shared/site
+bun run convex/scripts/score_fixtures.ts
+```
+It scores four fixtures with the same module `runWatchPass` calls — an obvious
+phishing email (expect `phish`), a benign newsletter (`safe`), a borderline
+vendor dunning mail (`suspect`) and an empty message (`unscored`, never `safe`)
+— and exits non-zero if any lands outside its expected verdict.
+---
 ## Typechecking (important)
 
 `convex/_generated/` — the generated types every file here imports — **does not

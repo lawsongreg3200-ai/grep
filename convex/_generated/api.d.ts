@@ -11,7 +11,9 @@
 import type * as chat from "../chat.js";
 import type * as crons from "../crons.js";
 import type * as http from "../http.js";
+import type * as lib_phishing from "../lib/phishing.js";
 import type * as lib_secrets from "../lib/secrets.js";
+import type * as scripts_score_fixtures from "../scripts/score_fixtures.js";
 import type * as watch from "../watch.js";
 
 import type {
@@ -24,7 +26,9 @@ declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   crons: typeof crons;
   http: typeof http;
+  "lib/phishing": typeof lib_phishing;
   "lib/secrets": typeof lib_secrets;
+  "scripts/score_fixtures": typeof scripts_score_fixtures;
   watch: typeof watch;
 }>;
 

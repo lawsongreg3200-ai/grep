@@ -18,6 +18,13 @@ import { httpAction, internalMutation } from "./_generated/server";
 import type { ActionCtx } from "./_generated/server";
 import { internal } from "./_generated/api";
 import { sealSecret } from "./lib/secrets";
+import {
+  hasScorableContent,
+  reasonsFor,
+  scoreEmail,
+  verdictForBand,
+  type ParsedEmail,
+} from "./lib/phishing";
 
 /* ------------------------------------------------------------------ */
 /* Auth — shared secret, fail closed                                   */
@@ -74,30 +81,62 @@ function guarded(fn: Handler) {
 /* ------------------------------------------------------------------ */
 
 /**
- * One watch pass: walk the enabled email connections, fetch new mail, score it.
+ * One message handed to the pass. Shaped to match `ParsedEmail` in
+ * `convex/lib/phishing.ts` so scoring is a straight call, and to match the
+ * `scans` columns so the write is a straight insert.
+ */
+const messageInput = v.object({
+  messageId: v.optional(v.string()), // RFC822 Message-ID — the identity/dedupe key
+  from: v.string(), // display form, "Name <addr@domain>"
+  fromDomain: v.optional(v.string()),
+  replyTo: v.optional(v.string()),
+  subject: v.string(),
+  body: v.string(),
+  links: v.optional(v.array(v.string())),
+  attachments: v.optional(v.array(v.string())),
+});
+
+/**
+ * One watch pass: walk the enabled email connections, score every message it
+ * is given, and write a REAL verdict per message.
  *
- * Today it does everything EXCEPT the actual scan, and says so in the data it
- * writes (one `scans` row with verdict "unscored"). It is driven two ways:
- *   - `convex/crons.ts` → every 5 minutes
+ * Driven two ways:
+ *   - `convex/crons.ts` → every 5 minutes (no messages: IMAP not ported yet)
  *   - `POST /watch/run` → on demand
  *
- * ── TODO(port) ──────────────────────────────────────────────────────────
- * The real pipeline lives in the site today and has to be ported into this
- * deployment:
- *   1. `src/lib/imap.ts` → `runEmailSync()`: IMAP fetch (imapflow) of new mail.
- *      imapflow needs real sockets, so the pass becomes an `action` with
- *      `"use node"` and the DB writes stay in a mutation like this one.
- *   2. `src/lib/phishing.ts` → `scoreEmail(parsed)`: score + band + explanation.
- *   3. `src/lib/urlcheck.ts` → Google Safe Browsing on each link.
- *   4. Per message: `ctx.db.insert("scans", { messageId, from, subject,
- *      verdict, score, reasons, links, createdAt })`, deduped on `by_message_id`
- *      (same rule as SQLite: Message-ID is the identity).
- * Then `scanned` / `flagged` become real counts instead of 0.
- * ────────────────────────────────────────────────────────────────────────
+ * HONESTY RULE (do not break this): a `scans` row may only read `safe` when a
+ * message was actually scored and came back Low. "unscored" means "nothing was
+ * looked at" and must never be displayed as an all-clear.
+ *
+ * ── TODO(port): IMAP fetch ─────────────────────────────────────────────
+ * Messages currently arrive via `args.messages` — the scorer is done, the
+ * fetching is not. Porting `src/lib/imap.ts` → `runEmailSync()` needs the
+ * owner's real email connection (Gmail app password / API-MCP), which we do
+ * not have yet. When it lands, `runWatchPass` becomes an `action` with
+ * `"use node"` (imapflow needs real sockets) that fetches, then calls this
+ * mutation with the parsed messages — the scoring and DB writes below stay
+ * exactly as they are.
+ * ───────────────────────────────────────────────────────────────────────
+ *
+ * ── TODO(port): URL reputation ────────────────────────────────────────
+ * `src/lib/urlcheck.ts` (Google Safe Browsing) is NOT ported. It needs the
+ * deployment env var `SAFEBROWSING_API_KEY`, which we cannot set from this
+ * session (the deploy key has no env-var permission). Link scoring today is
+ * heuristic-only (see `convex/lib/phishing.ts` signals 1–3).
+ * ───────────────────────────────────────────────────────────────────────
  */
 export const runWatchPass = internalMutation({
-  args: { source: v.union(v.literal("cron"), v.literal("http"), v.literal("manual")) },
-  returns: v.object({ ok: v.boolean(), scanned: v.number(), flagged: v.number() }),
+  args: {
+    source: v.union(v.literal("cron"), v.literal("http"), v.literal("manual")),
+    /** Messages to score. Absent/empty means nothing was fetched this pass. */
+    messages: v.optional(v.array(messageInput)),
+  },
+  returns: v.object({
+    ok: v.boolean(),
+    scanned: v.number(),
+    flagged: v.number(),
+    unscored: v.number(),
+  }),
   handler: async (ctx, args) => {
     const now = Date.now();
     const watches = await ctx.db
@@ -105,31 +144,100 @@ export const runWatchPass = internalMutation({
       .withIndex("by_enabled", (q) => q.eq("enabled", true))
       .collect();
 
-    // TODO(port): fetch + score each watch's mail here (see block above).
+    // TODO(port): fetch each watch's mail here — see the IMAP TODO above.
     for (const watch of watches) {
       await ctx.db.patch(watch._id, { lastRunAt: now, lastRunOk: true, lastError: undefined });
     }
 
-    const scanned = 0;
-    const flagged = 0;
+    const messages = args.messages ?? [];
+    let scanned = 0;
+    let flagged = 0;
+    let unscored = 0;
 
-    // Record that a pass ran. "unscored" is the honest verdict: no message was
-    // fetched and nothing was scored — this row must never read as "all clear".
-    await ctx.db.insert("scans", {
-      messageId: "",
-      from: "",
-      subject: `watch pass (${args.source}) — no messages fetched`,
-      verdict: "unscored",
-      score: 0,
-      reasons: [
-        "IMAP + phishing pipeline not ported into this deployment yet",
-        `${watches.length} enabled connection(s) configured`,
-      ],
-      links: [],
-      createdAt: now,
-    });
+    for (const message of messages) {
+      const parsed: ParsedEmail = {
+        id: message.messageId ?? "",
+        from: message.from,
+        fromDomain: message.fromDomain,
+        replyTo: message.replyTo,
+        subject: message.subject,
+        body: message.body,
+        links: message.links,
+        attachments: message.attachments,
+      };
 
-    return { ok: true, scanned, flagged };
+      // Same identity rule as SQLite: Message-ID is the identity. Already-scanned
+      // messages are skipped rather than re-scored, so a 5-minute cron cannot
+      // inflate the history.
+      if (parsed.id) {
+        const seen = await ctx.db
+          .query("scans")
+          .withIndex("by_message_id", (q) => q.eq("messageId", parsed.id))
+          .first();
+        if (seen) continue;
+      }
+
+      const links = message.links ?? [];
+
+      // CASE 1 — nothing to score. Write "unscored", NEVER "safe": we did not
+      // look at content, so we have no basis to call this mail clean.
+      if (!hasScorableContent(parsed)) {
+        unscored++;
+        await ctx.db.insert("scans", {
+          messageId: parsed.id,
+          from: parsed.from,
+          subject: parsed.subject || "(no subject)",
+          verdict: "unscored",
+          score: 0,
+          reasons: [
+            "No message content to score (empty subject, body, links and attachments) — this is NOT an all-clear.",
+            `Pass source: ${args.source}.`,
+          ],
+          links,
+          createdAt: now,
+        });
+        continue;
+      }
+
+      // CASE 2 — real content, so run the ported heuristics and write the
+      // verdict they actually produce.
+      const result = scoreEmail(parsed);
+      const verdict = verdictForBand(result.band);
+      await ctx.db.insert("scans", {
+        messageId: parsed.id,
+        from: parsed.from,
+        subject: parsed.subject || "(no subject)",
+        verdict,
+        score: result.score,
+        reasons: reasonsFor(result),
+        links,
+        createdAt: now,
+      });
+      scanned++;
+      if (verdict === "phish" || verdict === "suspect") flagged++;
+    }
+
+    // CASE 3 — the pass ran but was handed no messages at all (today: the cron
+    // and POST /watch/run, because IMAP is not ported). Record that a pass ran
+    // with verdict "unscored" so the history shows the gap honestly.
+    if (messages.length === 0) {
+      await ctx.db.insert("scans", {
+        messageId: "",
+        from: "",
+        subject: `watch pass (${args.source}) — no messages fetched`,
+        verdict: "unscored",
+        score: 0,
+        reasons: [
+          "No messages were fetched: live IMAP is not ported yet (needs the owner's real email connection). This pass did NOT look at any mail — it is not an all-clear.",
+          "Phishing scoring IS ported (convex/lib/phishing.ts) and runs on any message handed to this pass.",
+          `${watches.length} enabled connection(s) configured`,
+        ],
+        links: [],
+        createdAt: now,
+      });
+    }
+
+    return { ok: true, scanned, flagged, unscored };
   },
 });
 
